@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 # Database path
-DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'swing_trader.db')
+DB_PATH = os.path.join(os.path.dirname(__file__), 'data', 'swing_trader.db')
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)

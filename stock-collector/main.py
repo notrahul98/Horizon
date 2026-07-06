@@ -7,6 +7,7 @@ Usage:
   python stock-collector/main.py --report      # print latest prices and run history
   python stock-collector/main.py --history TCS.NS  # print recent history for a symbol
   python stock-collector/main.py --status      # print database summary
+  python stock-collector/main.py --corporate   # fetch corporate actions (earnings/dividends/insider) once
 """
 
 import argparse
@@ -46,6 +47,8 @@ def main():
                         help="Print database summary and exit")
     parser.add_argument("--refresh",  action="store_true",
                         help="Force a fresh watchlist fetch (ignore cache)")
+    parser.add_argument("--corporate", action="store_true",
+                        help="Fetch corporate actions (earnings/dividends/insider) once and exit")
     args = parser.parse_args()
 
     logger.info("Loading watchlist ...")
@@ -68,6 +71,12 @@ def main():
 
     if args.history:
         print_symbol_history(DB_PATH, args.history, limit=30)
+        return
+
+    if args.corporate:
+        from corporate_actions import fetch_all_corporate_data
+        logger.info("--- Running one-off corporate actions fetch ---")
+        fetch_all_corporate_data([s["symbol"] for s in watchlist])
         return
 
     if args.collect:

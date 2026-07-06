@@ -76,6 +76,9 @@ from flask import Flask, render_template_string, request, jsonify
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "stocks.db")
 app = Flask(__name__)
 
+from corporate_dashboard import corporate_bp
+app.register_blueprint(corporate_bp)
+
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
