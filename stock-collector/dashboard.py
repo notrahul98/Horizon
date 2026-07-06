@@ -1,68 +1,10 @@
 """
 Nifty 150 Terminal Dashboard v3
-- Auto-installs yfinance if missing
 - Corporate data fetched live from Yahoo Finance
 - Full interactive dashboard with 4 tabs
 """
 
-import sys
 import os
-import subprocess
-import glob
-
-def ensure_yfinance():
-    """Find yfinance in any location, or install it"""
-    try:
-        import yfinance
-        return True
-    except ImportError:
-        pass
-
-    # Search all possible site-packages locations
-    patterns = [
-        '/app/*/site-packages',
-        '/app/.venv/lib/*/site-packages',
-        '/usr/local/lib/*/site-packages',
-        '/usr/lib/*/site-packages',
-        '/mise/installs/python/*/lib/*/site-packages',
-        '/root/.local/lib/*/site-packages',
-    ]
-    for pattern in patterns:
-        for path in glob.glob(pattern):
-            if path not in sys.path:
-                sys.path.insert(0, path)
-            try:
-                import yfinance
-                return True
-            except ImportError:
-                continue
-
-    # Auto-install as last resort
-    try:
-        subprocess.check_call([
-            sys.executable, '-m', 'pip', 'install',
-            'yfinance', 'requests', '--quiet', '--target=/app/pkgs'
-        ])
-        sys.path.insert(0, '/app/pkgs')
-        import yfinance
-        return True
-    except Exception as e:
-        print(f"yfinance install failed: {e}")
-        return False
-
-YFINANCE_AVAILABLE = ensure_yfinance()
-
-for p in ['/app', '/app/pkgs',
-          '/app/.venv/lib/python3.13/site-packages',
-          '/mise/installs/python/3.13.14/lib/python3.13/site-packages']:
-    if os.path.isdir(p) and p not in sys.path:
-        sys.path.insert(0, p)
-
-_venv_site = os.path.join(os.path.dirname(__file__), "..", ".pythonlibs", "lib", "python3.11", "site-packages")
-if os.path.isdir(_venv_site) and _venv_site not in sys.path:
-    sys.path.insert(0, _venv_site)
-
-
 import sqlite3
 import json
 from datetime import datetime, timezone, timedelta
@@ -234,12 +176,6 @@ def api_chart(symbol):
 def api_corporate(symbol):
     """Fetch corporate data using yfinance (Yahoo Finance works on Railway)"""
     try:
-        # Use sys.path trick that worked in console
-        import sys
-        for p in ['/app', '/mise/installs/python/3.13.14/lib/python3.13/site-packages']:
-            if p not in sys.path:
-                sys.path.insert(0, p)
-
         import yfinance as yf
 
         if not symbol.endswith('.NS'):
