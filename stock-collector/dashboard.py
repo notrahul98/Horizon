@@ -584,6 +584,39 @@ def api_chart(symbol):
     return jsonify({"chart": json.dumps(fig, cls=PlotlyJSONEncoder)})
 
 
+@app.route("/api/live-price/<symbol>")
+def api_live_price(symbol):
+    """Cheap single-symbol price poll for the detail page's live-price ticker.
+
+    Deliberately scoped to one symbol, not all 150 — yfinance is an unofficial,
+    delayed data source (not a real streaming feed), and polling the full
+    watchlist this frequently would risk rate-limiting. `fast_info` is the
+    lightweight yfinance call (a handful of fields, not the full `.info`
+    payload), so this is cheap enough for a client to poll every 30-60s
+    for whichever single stock page is actually open.
+    """
+    import yfinance as yf
+
+    if not symbol.endswith('.NS'):
+        symbol = symbol + '.NS'
+    try:
+        fi = yf.Ticker(symbol).fast_info
+        price = fi.get('lastPrice')
+        prev_close = fi.get('previousClose')
+        if price is None:
+            return jsonify({"error": "No live price available"}), 502
+        day_chg = round((price - prev_close) / prev_close * 100, 2) if prev_close else None
+        return jsonify({
+            "symbol": symbol,
+            "price": round(float(price), 2),
+            "day_chg": day_chg,
+            "fetched_at": ist_now(),
+        })
+    except Exception as e:
+        logger.warning("[live_price] failed for %s: %s", symbol, e)
+        return jsonify({"error": str(e)}), 502
+
+
 @app.route("/api/analysts/<symbol>")
 def api_analysts(symbol):
     """Analyst consensus + price targets + recent news, live from yfinance.
@@ -1231,6 +1264,10 @@ body{min-height:100vh;}
     <div class="detail-price">
       <span class="price" id="detailPrice">-</span>
       <span class="chg" id="detailChg">-</span>
+      <span id="liveIndicator" style="display:none;align-items:center;gap:5px;margin-left:8px;">
+        <span style="width:6px;height:6px;border-radius:50%;background:var(--green);animation:blink 2s infinite;display:inline-block;"></span>
+        <span style="font-size:10px;color:var(--dim);" id="liveIndicatorText">live</span>
+      </span>
     </div>
   </div>
   <div class="detail-tabs">
@@ -1746,11 +1783,60 @@ async function loadAnalysts(){
   }
 }
 
+// Live price polling — scoped to just this one stock (not the whole
+// watchlist) since yfinance isn't a real streaming feed and polling all 150
+// symbols this often would risk rate-limiting. Only runs during NSE market
+// hours, and pauses while the tab isn't visible.
+let livePricePoller=null;
+
+function isMarketHours(){
+  const ist=new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Kolkata'}));
+  const day=ist.getDay();
+  if(day===0||day===6) return false;
+  const mins=ist.getHours()*60+ist.getMinutes();
+  return mins>=9*60 && mins<=(15*60+35);
+}
+
+async function pollLivePrice(){
+  try{
+    const r=await fetch(`/api/live-price/${sym}`);
+    const d=await r.json();
+    if(d.error) return;
+    document.getElementById('detailPrice').textContent=`₹${d.price}`;
+    if(d.day_chg!=null){
+      const chgEl=document.getElementById('detailChg');
+      chgEl.textContent=`${d.day_chg>=0?'+':''}${d.day_chg}%`;
+      chgEl.style.color=d.day_chg>=0?'#34d399':'#f87171';
+    }
+  }catch(e){}
+}
+
+function startLivePricing(){
+  const ind=document.getElementById('liveIndicator');
+  if(!isMarketHours()){
+    ind.style.display='none';
+    return;
+  }
+  ind.style.display='flex';
+  pollLivePrice();
+  if(livePricePoller) clearInterval(livePricePoller);
+  livePricePoller=setInterval(pollLivePrice, 30000);
+}
+
+document.addEventListener('visibilitychange', ()=>{
+  if(document.hidden){
+    if(livePricePoller){clearInterval(livePricePoller);livePricePoller=null;}
+  } else {
+    startLivePricing();
+  }
+});
+
 loadChart();
 loadTechnical();
 loadCorporate();
 loadAIConsensus();
 loadAnalysts();
+startLivePricing();
 </script>
 </body>
 </html>"""
