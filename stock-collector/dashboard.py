@@ -457,7 +457,7 @@ def stock_page(symbol):
 BASE_STYLE = r"""
 :root{--bg:#0a0a0f;--card:#111118;--hover:#16161f;--border:#1e1e2a;--text:#9ca3af;--dim:#6b7280;--bright:#e5e7eb;--green:#34d399;--red:#f87171;--blue:#38bdf8;--amber:#fbbf24;--purple:#a78bfa;}
 *{box-sizing:border-box;margin:0;padding:0;}
-body{background:var(--bg);color:var(--text);font-family:ui-monospace,'SFMono-Regular',Menlo,Monaco,Consolas,monospace;font-size:12px;}
+body{background:var(--bg);color:var(--text);font-family:ui-monospace,'SFMono-Regular',Menlo,Monaco,Consolas,monospace;font-size:13px;}
 .nav{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--border);background:#0d0d14;flex-shrink:0;}
 .nav-brand{display:flex;align-items:center;gap:10px;}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:blink 2s infinite;}
@@ -468,7 +468,7 @@ body{background:var(--bg);color:var(--text);font-family:ui-monospace,'SFMono-Reg
 .nav-back:hover{color:var(--bright);}
 .nav-meta{color:var(--dim);font-size:11px;}
 .section-title{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--blue);margin:14px 0 6px;border-bottom:1px solid var(--border);padding-bottom:4px;}
-.stat-box{background:var(--bg);padding:10px 12px;border-radius:3px;border:1px solid var(--border);}
+.stat-box{background:var(--card);padding:12px 14px;border-radius:0 8px 8px 0;border-left:3px solid var(--border);}
 .stat-label{font-size:9px;color:var(--dim);text-transform:uppercase;margin-bottom:3px;}
 .stat-val{font-size:15px;font-weight:700;color:var(--bright);}
 .stat-val.g{color:var(--green)}.stat-val.r{color:var(--red)}.stat-val.a{color:var(--amber)}.stat-val.b{color:var(--blue)}.stat-val.p{color:var(--purple)}
@@ -491,39 +491,52 @@ DASHBOARD_HTML = r"""<!doctype html>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
 """ + BASE_STYLE + r"""
-body{height:100vh;overflow:hidden;display:flex;flex-direction:column;}
-.body{display:grid;grid-template-columns:260px 1fr;flex:1;overflow:hidden;}
+body{height:100vh;overflow:hidden;display:flex;flex-direction:column;font-size:13px;}
+.body{display:grid;grid-template-columns:280px 1fr;flex:1;overflow:hidden;}
 .sidebar{border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;}
-.sidebar-kpis{padding:12px;display:flex;flex-direction:column;gap:7px;border-bottom:1px solid var(--border);}
-.kpi{background:var(--card);border-left:2px solid;padding:8px 10px;border-radius:3px;}
+.sidebar-kpis{padding:16px;display:flex;flex-direction:column;gap:10px;border-bottom:1px solid var(--border);}
+.kpi{background:var(--card);border-left:3px solid;border-radius:0 8px 8px 0;padding:12px 14px;}
 .kpi.g{border-color:var(--green)}.kpi.b{border-color:var(--blue)}.kpi.a{border-color:var(--amber)}.kpi.r{border-color:var(--red)}.kpi.p{border-color:var(--purple)}
-.kpi-label{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:3px;}
-.kpi-val{font-size:17px;font-weight:700;}
+.kpi-label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:5px;}
+.kpi-val{font-size:24px;font-weight:700;}
 .kpi-val.g{color:var(--green)}.kpi-val.b{color:var(--blue)}.kpi-val.a{color:var(--amber)}.kpi-val.r{color:var(--red)}.kpi-val.p{color:var(--purple)}
-.sidebar-charts{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:10px;}
-.chart-label{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:5px;}
-.chart-box{height:180px;}
+.sidebar-charts{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:16px;}
+.chart-label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:6px;}
+.chart-box{height:190px;}
 .main{display:flex;flex-direction:column;overflow:hidden;}
-.table-header{padding:10px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;}
-.tbl-title{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);}
-.search-box{background:var(--bg);border:1px solid var(--border);color:var(--bright);padding:5px 12px;border-radius:3px;font-family:inherit;font-size:12px;width:220px;}
+.table-header{padding:14px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;gap:16px;flex-wrap:wrap;}
+.tbl-title{font-size:11px;color:var(--dim);}
+.search-box{background:var(--bg);border:1px solid var(--border);color:var(--bright);padding:7px 14px;border-radius:6px;font-family:inherit;font-size:13px;width:240px;}
 .search-box:focus{outline:none;border-color:var(--blue);}
-.table-wrap{flex:1;overflow-y:auto;}
+.table-wrap{flex:1;overflow:auto;}
 table{width:100%;border-collapse:collapse;}
-thead th{position:sticky;top:0;background:#0d0d14;padding:9px 14px;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);border-bottom:1px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap;}
+thead th{position:sticky;top:0;background:#0d0d14;padding:11px 16px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);border-bottom:1px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap;z-index:2;}
 thead th:hover{color:var(--bright);}
 thead th.r{text-align:right;}
-tbody td{padding:8px 14px;border-bottom:1px solid rgba(30,30,42,.8);white-space:nowrap;}
+thead th.sym-col{position:sticky;left:0;z-index:3;}
+tbody td{padding:12px 16px;border-bottom:1px solid rgba(30,30,42,.8);white-space:nowrap;}
 tbody tr{cursor:pointer;transition:background .1s;}
 tbody tr:hover{background:var(--hover);}
-.sym{font-weight:700;color:var(--bright);font-size:13px;}
-.name-cell{color:var(--text);max-width:220px;overflow:hidden;text-overflow:ellipsis;}
-.tag{font-size:9px;padding:2px 5px;border-radius:2px;background:#1f2937;color:var(--dim);}
+tbody tr:hover .sym-col{background:var(--hover);}
+.sym-col{position:sticky;left:0;background:var(--bg);border-left:3px solid transparent;}
+.sym-col.up{border-left-color:var(--green);}
+.sym-col.dn{border-left-color:var(--red);}
+.sym{font-weight:700;color:var(--bright);font-size:14px;display:block;}
+.name-sub{color:var(--dim);font-size:11px;margin-top:2px;max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.tag{font-size:10px;padding:3px 7px;border-radius:4px;background:#1f2937;color:var(--dim);}
 .num{text-align:right;}
 .up{color:var(--green);font-weight:700;}
 .dn{color:var(--red);font-weight:700;}
 .dim{color:var(--dim);}
-@media(max-width:900px){.body{grid-template-columns:1fr}.sidebar{display:none}}
+@media(max-width:1000px){
+  .body{grid-template-columns:1fr}
+  .sidebar{flex-direction:row;flex-wrap:wrap;border-right:none;border-bottom:1px solid var(--border);}
+  .sidebar-kpis{flex-direction:row;flex-wrap:wrap;border-bottom:none;flex:1;}
+  .kpi{flex:1;min-width:120px;}
+  .sidebar-charts{display:none;}
+}
+@media(max-width:760px){.hide-narrow{display:none;}}
+@media(max-width:560px){.hide-mobile{display:none;}}
 </style>
 </head>
 <body>
@@ -546,7 +559,7 @@ tbody tr:hover{background:var(--hover);}
       </div>
       <div class="kpi g"><div class="kpi-label">Gainers</div><div class="kpi-val g">{{ gainers }}</div></div>
       <div class="kpi r"><div class="kpi-label">Losers</div><div class="kpi-val r">{{ losers }}</div></div>
-      <div class="kpi a"><div class="kpi-label">Top Gainer</div><div class="kpi-val a" style="font-size:11px">{{ top_gainer }}</div></div>
+      <div class="kpi a"><div class="kpi-label">Top Gainer</div><div class="kpi-val a" style="font-size:13px">{{ top_gainer }}</div></div>
     </div>
     <div class="sidebar-charts">
       <div><div class="chart-label">Sector Distribution</div><div class="chart-box" id="sec-chart"></div></div>
@@ -556,21 +569,20 @@ tbody tr:hover{background:var(--hover);}
   <!-- MAIN TABLE -->
   <div class="main">
     <div class="table-header">
-      <span class="tbl-title">Live Quote Feed · {{ latest_date }} · {{ total }} stocks · click a row for full details</span>
+      <span class="tbl-title">{{ latest_date }} · {{ total }} stocks · click a row for full details</span>
       <input class="search-box" id="searchBox" placeholder="Search symbol, name, sector..." oninput="filterTable()">
     </div>
     <div class="table-wrap">
       <table id="stockTable">
         <thead>
           <tr>
-            <th onclick="sortTable('sym')">Symbol</th>
-            <th>Name</th>
-            <th>Sector</th>
+            <th class="sym-col" onclick="sortTable('sym')">Symbol</th>
+            <th class="hide-narrow">Sector</th>
             <th class="r" onclick="sortTable('close')">Close ₹</th>
             <th class="r" onclick="sortTable('chg')">Chg%</th>
-            <th class="r" onclick="sortTable('high')">High</th>
-            <th class="r" onclick="sortTable('low')">Low</th>
-            <th class="r" onclick="sortTable('vol')">Volume</th>
+            <th class="r hide-narrow" onclick="sortTable('high')">High</th>
+            <th class="r hide-narrow" onclick="sortTable('low')">Low</th>
+            <th class="r hide-mobile" onclick="sortTable('vol')">Volume</th>
           </tr>
         </thead>
         <tbody id="stockBody">
@@ -579,14 +591,16 @@ tbody tr:hover{background:var(--hover);}
               data-sym="{{ s.symbol }}" data-name="{{ s.name }}" data-sector="{{ s.sector }}"
               data-close="{{ s.close }}" data-chg="{{ s.day_chg }}"
               data-high="{{ s.high }}" data-low="{{ s.low }}" data-vol="{{ s.volume }}">
-            <td class="sym">{{ s.symbol.replace('.NS','') }}</td>
-            <td class="name-cell">{{ s.name }}</td>
-            <td><span class="tag">{{ s.sector[:16] }}</span></td>
+            <td class="sym-col {% if s.day_chg >= 0 %}up{% else %}dn{% endif %}">
+              <span class="sym">{{ s.symbol.replace('.NS','') }}</span>
+              <span class="name-sub">{{ s.name }}</span>
+            </td>
+            <td class="hide-narrow"><span class="tag">{{ s.sector[:16] }}</span></td>
             <td class="num">₹{{ "%.2f"|format(s.close) }}</td>
             <td class="num {% if s.day_chg >= 0 %}up{% else %}dn{% endif %}">{% if s.day_chg >= 0 %}+{% endif %}{{ "%.2f"|format(s.day_chg) }}%</td>
-            <td class="num">{{ "%.2f"|format(s.high) }}</td>
-            <td class="num">{{ "%.2f"|format(s.low) }}</td>
-            <td class="num dim">{{ "{:.1f}M".format(s.volume/1000000) }}</td>
+            <td class="num hide-narrow">{{ "%.2f"|format(s.high) }}</td>
+            <td class="num hide-narrow">{{ "%.2f"|format(s.low) }}</td>
+            <td class="num dim hide-mobile">{{ "{:.1f}M".format(s.volume/1000000) }}</td>
           </tr>
           {% endfor %}
         </tbody>
