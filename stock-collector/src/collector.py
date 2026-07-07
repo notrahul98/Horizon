@@ -65,7 +65,15 @@ def collect_historical(db_path: str, watchlist: list, period: str = "1y") -> Non
             )
 
             rows = []
+            skipped = 0
             for ts, row in hist.iterrows():
+                close = _safe_float(row.get("Close"))
+                if close is None:
+                    # price_history.close is NOT NULL; insert_prices() runs one
+                    # executemany() per symbol, so a single bad row here would
+                    # otherwise abort the whole symbol's insert, not just that row.
+                    skipped += 1
+                    continue
                 date_str = ts.strftime("%Y-%m-%d")
                 rows.append({
                     "symbol": symbol,
@@ -74,10 +82,12 @@ def collect_historical(db_path: str, watchlist: list, period: str = "1y") -> Non
                     "open": _safe_float(row.get("Open")),
                     "high": _safe_float(row.get("High")),
                     "low": _safe_float(row.get("Low")),
-                    "close": _safe_float(row.get("Close")),
+                    "close": close,
                     "adj_close": _safe_float(row.get("Adj Close")),
                     "volume": _safe_int(row.get("Volume")),
                 })
+            if skipped:
+                logger.warning("[historical] %s: skipped %d row(s) with no close price", symbol, skipped)
 
             written = insert_prices(db_path, rows)
             total_records += written
@@ -109,7 +119,12 @@ def collect_intraday(db_path: str, watchlist: list,
                 continue
 
             rows = []
+            skipped = 0
             for ts, row in hist.iterrows():
+                close = _safe_float(row.get("Close"))
+                if close is None:
+                    skipped += 1
+                    continue
                 date_str = ts.strftime("%Y-%m-%d %H:%M:%S")
                 rows.append({
                     "symbol": symbol,
@@ -118,10 +133,12 @@ def collect_intraday(db_path: str, watchlist: list,
                     "open": _safe_float(row.get("Open")),
                     "high": _safe_float(row.get("High")),
                     "low": _safe_float(row.get("Low")),
-                    "close": _safe_float(row.get("Close")),
+                    "close": close,
                     "adj_close": _safe_float(row.get("Adj Close")),
                     "volume": _safe_int(row.get("Volume")),
                 })
+            if skipped:
+                logger.warning("[intraday] %s: skipped %d row(s) with no close price", symbol, skipped)
 
             written = insert_prices(db_path, rows)
             total_records += written

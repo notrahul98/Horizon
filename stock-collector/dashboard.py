@@ -7,6 +7,8 @@ Nifty 150 Terminal Dashboard v3
 import os
 import sqlite3
 import json
+import logging
+import threading
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -14,9 +16,15 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.utils import PlotlyJSONEncoder
 from flask import Flask, render_template_string, request, jsonify
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from src.database import init_db
+from src.collector import collect_historical
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "stocks.db")
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
 
 from corporate_dashboard import corporate_bp
 app.register_blueprint(corporate_bp)
@@ -44,9 +52,15 @@ PLOTLY_DARK = dict(
 
 
 def get_latest_df():
+    # day_chg here must match get_stock_detail()'s definition (prev close -> today's
+    # close), not today's open -> close — otherwise the table and the per-stock detail
+    # page show two different numbers for the same "Chg%" label.
     q = """
         SELECT p.symbol, s.name, s.sector,
-               p.date, p.close, p.open, p.high, p.low, p.volume
+               p.date, p.close, p.open, p.high, p.low, p.volume,
+               (SELECT p2.close FROM price_history p2
+                WHERE p2.symbol = p.symbol AND p2.interval = 'day' AND p2.date < p.date
+                ORDER BY p2.date DESC LIMIT 1) AS prev_close
         FROM price_history p
         JOIN stocks s ON s.symbol = p.symbol
         WHERE p.interval = 'day'
@@ -56,7 +70,8 @@ def get_latest_df():
     """
     with get_conn() as c:
         df = pd.read_sql_query(q, c)
-    df["day_chg"] = ((df["close"] - df["open"]) / df["open"] * 100).round(2)
+    base = df["prev_close"].fillna(df["open"])
+    df["day_chg"] = ((df["close"] - base) / base * 100).round(2)
     return df
 
 
@@ -138,6 +153,51 @@ def get_stock_detail(symbol):
         "trend_color": trend_color,
         "sma20": round(float(sma20), 2),
     }
+
+
+# ── Daily auto-refresh ──────────────────────────────────────────
+# Railway's filesystem is ephemeral (no persistent volume attached), so instead
+# of relying on data accumulated over time, every boot pulls whatever session
+# yfinance currently has available (today's close if it's past NSE market close,
+# otherwise the previous session's), and a background job repeats that at 16:00
+# IST daily for as long as this process keeps running. Only price_history needs
+# refreshing here — fundamentals/corporate data are fetched live per-request via
+# /api/corporate/<symbol> already, not read from the DB.
+def _watchlist_from_db():
+    with get_conn() as c:
+        rows = c.execute("SELECT symbol, name, sector FROM stocks").fetchall()
+    return [{"symbol": r["symbol"], "name": r["name"], "sector": r["sector"]} for r in rows]
+
+
+def _run_daily_refresh():
+    try:
+        init_db(DB_PATH)
+        watchlist = _watchlist_from_db()
+        if not watchlist:
+            logger.warning("[daily_refresh] no watchlist in DB yet, skipping")
+            return
+        logger.info("[daily_refresh] pulling latest session for %d symbols ...", len(watchlist))
+        collect_historical(DB_PATH, watchlist, period="1y")
+        logger.info("[daily_refresh] done")
+    except Exception:
+        logger.exception("[daily_refresh] failed")
+
+
+def _start_scheduler():
+    threading.Thread(target=_run_daily_refresh, daemon=True).start()
+
+    sched = BackgroundScheduler(timezone="Asia/Kolkata")
+    sched.add_job(
+        _run_daily_refresh,
+        CronTrigger(day_of_week="mon-fri", hour=16, minute=0),
+        id="daily_refresh",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    sched.start()
+
+
+_start_scheduler()
 
 
 @app.route("/api/stock/<symbol>")
@@ -364,7 +424,7 @@ def index():
     gainers = len(df[df["day_chg"] > 0])
     losers = len(df[df["day_chg"] < 0])
 
-    return render_template_string(HTML,
+    return render_template_string(DASHBOARD_HTML,
         ist_time=ist_now(),
         stocks=stocks,
         total=len(df),
@@ -379,7 +439,50 @@ def index():
     )
 
 
-HTML = r"""<!doctype html>
+@app.route("/stock/<symbol>")
+def stock_page(symbol):
+    with get_conn() as c:
+        row = c.execute("SELECT symbol, name, sector FROM stocks WHERE symbol=?", (symbol,)).fetchone()
+    if row is None:
+        return f"<h1 style='color:#9ca3af;font-family:monospace;padding:40px'>Unknown symbol {symbol}</h1>", 404
+
+    return render_template_string(DETAIL_HTML,
+        ist_time=ist_now(),
+        symbol=row["symbol"],
+        name=row["name"],
+        sector=row["sector"],
+    )
+
+
+BASE_STYLE = r"""
+:root{--bg:#0a0a0f;--card:#111118;--hover:#16161f;--border:#1e1e2a;--text:#9ca3af;--dim:#6b7280;--bright:#e5e7eb;--green:#34d399;--red:#f87171;--blue:#38bdf8;--amber:#fbbf24;--purple:#a78bfa;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);color:var(--text);font-family:ui-monospace,'SFMono-Regular',Menlo,Monaco,Consolas,monospace;font-size:12px;}
+.nav{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--border);background:#0d0d14;flex-shrink:0;}
+.nav-brand{display:flex;align-items:center;gap:10px;}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:blink 2s infinite;}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.brand-name{color:var(--green);font-size:14px;font-weight:700;letter-spacing:.12em;text-decoration:none;}
+.nav-links{display:flex;align-items:center;gap:16px;}
+.nav-back{color:var(--dim);text-decoration:none;font-size:11px;}
+.nav-back:hover{color:var(--bright);}
+.nav-meta{color:var(--dim);font-size:11px;}
+.section-title{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--blue);margin:14px 0 6px;border-bottom:1px solid var(--border);padding-bottom:4px;}
+.stat-box{background:var(--bg);padding:10px 12px;border-radius:3px;border:1px solid var(--border);}
+.stat-label{font-size:9px;color:var(--dim);text-transform:uppercase;margin-bottom:3px;}
+.stat-val{font-size:15px;font-weight:700;color:var(--bright);}
+.stat-val.g{color:var(--green)}.stat-val.r{color:var(--red)}.stat-val.a{color:var(--amber)}.stat-val.b{color:var(--blue)}.stat-val.p{color:var(--purple)}
+.prog-bg{background:var(--border);border-radius:2px;height:5px;width:100%;margin-top:4px;}
+.prog-fill{height:5px;border-radius:2px;transition:width .4s;}
+.corp-signal{padding:10px 14px;border-radius:4px;text-align:center;font-size:14px;font-weight:700;margin-bottom:10px;}
+.corp-flag{background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.3);color:var(--amber);padding:6px 10px;border-radius:3px;margin:4px 0;font-size:12px;}
+.corp-reason{background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.2);color:var(--green);padding:6px 10px;border-radius:3px;margin:4px 0;font-size:12px;}
+.hist-row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--blue);border-radius:50%;animation:spin .8s linear infinite;margin-right:6px;}
+@keyframes spin{to{transform:rotate(360deg)}}
+"""
+
+DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -387,16 +490,9 @@ HTML = r"""<!doctype html>
 <title>Nifty 150 Terminal</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
-:root{--bg:#0a0a0f;--card:#111118;--hover:#16161f;--border:#1e1e2a;--text:#9ca3af;--dim:#6b7280;--bright:#e5e7eb;--green:#34d399;--red:#f87171;--blue:#38bdf8;--amber:#fbbf24;--purple:#a78bfa;}
-*{box-sizing:border-box;margin:0;padding:0;}
-body{background:var(--bg);color:var(--text);font-family:ui-monospace,'SFMono-Regular',Menlo,Monaco,Consolas,monospace;font-size:12px;height:100vh;overflow:hidden;display:flex;flex-direction:column;}
-.nav{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--border);background:#0d0d14;flex-shrink:0;}
-.nav-brand{display:flex;align-items:center;gap:10px;}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:blink 2s infinite;}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-.brand-name{color:var(--green);font-size:14px;font-weight:700;letter-spacing:.12em;}
-.nav-meta{color:var(--dim);font-size:11px;}
-.body{display:grid;grid-template-columns:220px 1fr 380px;flex:1;overflow:hidden;}
+""" + BASE_STYLE + r"""
+body{height:100vh;overflow:hidden;display:flex;flex-direction:column;}
+.body{display:grid;grid-template-columns:260px 1fr;flex:1;overflow:hidden;}
 .sidebar{border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;}
 .sidebar-kpis{padding:12px;display:flex;flex-direction:column;gap:7px;border-bottom:1px solid var(--border);}
 .kpi{background:var(--card);border-left:2px solid;padding:8px 10px;border-radius:3px;}
@@ -406,60 +502,28 @@ body{background:var(--bg);color:var(--text);font-family:ui-monospace,'SFMono-Reg
 .kpi-val.g{color:var(--green)}.kpi-val.b{color:var(--blue)}.kpi-val.a{color:var(--amber)}.kpi-val.r{color:var(--red)}.kpi-val.p{color:var(--purple)}
 .sidebar-charts{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:10px;}
 .chart-label{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:5px;}
-.chart-box{height:140px;}
-.main{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border);}
-.table-header{padding:8px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;}
+.chart-box{height:180px;}
+.main{display:flex;flex-direction:column;overflow:hidden;}
+.table-header{padding:10px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;}
 .tbl-title{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);}
-.search-box{background:var(--bg);border:1px solid var(--border);color:var(--bright);padding:4px 10px;border-radius:3px;font-family:inherit;font-size:11px;width:180px;}
+.search-box{background:var(--bg);border:1px solid var(--border);color:var(--bright);padding:5px 12px;border-radius:3px;font-family:inherit;font-size:12px;width:220px;}
 .search-box:focus{outline:none;border-color:var(--blue);}
 .table-wrap{flex:1;overflow-y:auto;}
 table{width:100%;border-collapse:collapse;}
-thead th{position:sticky;top:0;background:#0d0d14;padding:7px 10px;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);border-bottom:1px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap;}
+thead th{position:sticky;top:0;background:#0d0d14;padding:9px 14px;text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);border-bottom:1px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap;}
 thead th:hover{color:var(--bright);}
 thead th.r{text-align:right;}
-tbody td{padding:6px 10px;border-bottom:1px solid rgba(30,30,42,.8);white-space:nowrap;}
+tbody td{padding:8px 14px;border-bottom:1px solid rgba(30,30,42,.8);white-space:nowrap;}
 tbody tr{cursor:pointer;transition:background .1s;}
 tbody tr:hover{background:var(--hover);}
-tbody tr.active{background:#1a1a2e;border-left:2px solid var(--blue);}
-.sym{font-weight:700;color:var(--bright);font-size:12px;}
-.name-cell{color:var(--text);max-width:150px;overflow:hidden;text-overflow:ellipsis;}
+.sym{font-weight:700;color:var(--bright);font-size:13px;}
+.name-cell{color:var(--text);max-width:220px;overflow:hidden;text-overflow:ellipsis;}
 .tag{font-size:9px;padding:2px 5px;border-radius:2px;background:#1f2937;color:var(--dim);}
 .num{text-align:right;}
 .up{color:var(--green);font-weight:700;}
 .dn{color:var(--red);font-weight:700;}
 .dim{color:var(--dim);}
-.detail{display:flex;flex-direction:column;overflow:hidden;background:var(--card);}
-.detail-header{padding:12px 16px;border-bottom:1px solid var(--border);flex-shrink:0;}
-.detail-sym{font-size:18px;font-weight:700;color:var(--bright);}
-.detail-name{color:var(--dim);font-size:11px;margin-top:2px;}
-.detail-price{display:flex;align-items:baseline;gap:10px;margin-top:8px;}
-.price{font-size:26px;font-weight:700;color:var(--bright);}
-.chg{font-size:14px;font-weight:700;}
-.detail-tabs{display:flex;gap:0;border-bottom:1px solid var(--border);flex-shrink:0;}
-.tab{padding:8px 16px;cursor:pointer;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);border-bottom:2px solid transparent;transition:all .2s;}
-.tab:hover{color:var(--bright);}
-.tab.active{color:var(--blue);border-bottom-color:var(--blue);}
-.detail-body{flex:1;overflow-y:auto;padding:12px 16px;}
-.tab-content{display:none;}
-.tab-content.active{display:block;}
-.section-title{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--blue);margin:10px 0 6px;border-bottom:1px solid var(--border);padding-bottom:4px;}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px;}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:8px;}
-.stat-box{background:var(--bg);padding:8px 10px;border-radius:3px;border:1px solid var(--border);}
-.stat-label{font-size:9px;color:var(--dim);text-transform:uppercase;margin-bottom:3px;}
-.stat-val{font-size:13px;font-weight:700;color:var(--bright);}
-.stat-val.g{color:var(--green)}.stat-val.r{color:var(--red)}.stat-val.a{color:var(--amber)}.stat-val.b{color:var(--blue)}.stat-val.p{color:var(--purple)}
-.prog-bg{background:var(--border);border-radius:2px;height:5px;width:100%;margin-top:4px;}
-.prog-fill{height:5px;border-radius:2px;transition:width .4s;}
-.corp-signal{padding:8px 12px;border-radius:4px;text-align:center;font-size:13px;font-weight:700;margin-bottom:8px;}
-.corp-flag{background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.3);color:var(--amber);padding:5px 8px;border-radius:3px;margin:3px 0;font-size:11px;}
-.corp-reason{background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.2);color:var(--green);padding:5px 8px;border-radius:3px;margin:3px 0;font-size:11px;}
-.hist-row{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-size:10px;}
-.spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--blue);border-radius:50%;animation:spin .8s linear infinite;margin-right:6px;}
-@keyframes spin{to{transform:rotate(360deg)}}
-.empty-detail{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--dim);gap:10px;}
-@media(max-width:1100px){.body{grid-template-columns:200px 1fr}.detail{display:none}}
-@media(max-width:700px){.body{grid-template-columns:1fr}.sidebar{display:none}}
+@media(max-width:900px){.body{grid-template-columns:1fr}.sidebar{display:none}}
 </style>
 </head>
 <body>
@@ -492,7 +556,7 @@ tbody tr.active{background:#1a1a2e;border-left:2px solid var(--blue);}
   <!-- MAIN TABLE -->
   <div class="main">
     <div class="table-header">
-      <span class="tbl-title">Live Quote Feed · {{ latest_date }} · {{ total }} stocks</span>
+      <span class="tbl-title">Live Quote Feed · {{ latest_date }} · {{ total }} stocks · click a row for full details</span>
       <input class="search-box" id="searchBox" placeholder="Search symbol, name, sector..." oninput="filterTable()">
     </div>
     <div class="table-wrap">
@@ -511,7 +575,7 @@ tbody tr.active{background:#1a1a2e;border-left:2px solid var(--blue);}
         </thead>
         <tbody id="stockBody">
           {% for s in stocks %}
-          <tr onclick="selectStock('{{ s.symbol }}','{{ s.name }}')"
+          <tr onclick="location.href='/stock/{{ s.symbol }}'"
               data-sym="{{ s.symbol }}" data-name="{{ s.name }}" data-sector="{{ s.sector }}"
               data-close="{{ s.close }}" data-chg="{{ s.day_chg }}"
               data-high="{{ s.high }}" data-low="{{ s.low }}" data-vol="{{ s.volume }}">
@@ -529,152 +593,6 @@ tbody tr.active{background:#1a1a2e;border-left:2px solid var(--blue);}
       </table>
     </div>
   </div>
-  <!-- DETAIL PANEL -->
-  <div class="detail" id="detailPanel">
-    <div class="empty-detail" id="emptyDetail">
-      <div style="font-size:28px;color:var(--border)">←</div>
-      <p>Click any stock to see details</p>
-      <p style="font-size:10px;color:#374151">Technicals · Fundamentals · Corporate Actions</p>
-    </div>
-    <div id="stockDetail" style="display:none;flex-direction:column;height:100%;overflow:hidden;">
-      <div class="detail-header">
-        <div class="detail-sym" id="detailSym">-</div>
-        <div class="detail-name" id="detailName">-</div>
-        <div class="detail-price">
-          <span class="price" id="detailPrice">-</span>
-          <span class="chg" id="detailChg">-</span>
-        </div>
-      </div>
-      <!-- TABS -->
-      <div class="detail-tabs">
-        <div class="tab active" onclick="switchTab('technical')">Technical</div>
-        <div class="tab" onclick="switchTab('fundamental')">Fundamental</div>
-        <div class="tab" onclick="switchTab('corporate')">Corporate</div>
-        <div class="tab" onclick="switchTab('company')">Company</div>
-      </div>
-      <div class="detail-body">
-        <!-- TECHNICAL TAB -->
-        <div class="tab-content active" id="tab-technical">
-          <div id="detailChart" style="height:220px"></div>
-          <div class="section-title">Today's Trading</div>
-          <div class="grid3">
-            <div class="stat-box"><div class="stat-label">Open</div><div class="stat-val" id="d-open">-</div></div>
-            <div class="stat-box"><div class="stat-label">High</div><div class="stat-val g" id="d-high">-</div></div>
-            <div class="stat-box"><div class="stat-label">Low</div><div class="stat-val r" id="d-low">-</div></div>
-            <div class="stat-box"><div class="stat-label">Prev Close</div><div class="stat-val" id="d-prev">-</div></div>
-            <div class="stat-box"><div class="stat-label">52W High</div><div class="stat-val g" id="d-52h">-</div></div>
-            <div class="stat-box"><div class="stat-label">52W Low</div><div class="stat-val r" id="d-52l">-</div></div>
-          </div>
-          <div class="section-title">Indicators</div>
-          <div class="grid2">
-            <div class="stat-box">
-              <div class="stat-label">Trend (EMA20 vs EMA50)</div>
-              <div class="stat-val" id="d-trend">-</div>
-            </div>
-            <div class="stat-box">
-              <div class="stat-label">RSI (14)</div>
-              <div class="stat-val" id="d-rsi">-</div>
-              <div class="prog-bg"><div class="prog-fill" id="d-rsi-bar" style="width:50%;background:#38bdf8"></div></div>
-            </div>
-            <div class="stat-box"><div class="stat-label">EMA 20</div><div class="stat-val b" id="d-ema20">-</div></div>
-            <div class="stat-box"><div class="stat-label">EMA 50</div><div class="stat-val a" id="d-ema50">-</div></div>
-            <div class="stat-box"><div class="stat-label">MACD</div><div class="stat-val" id="d-macd">-</div></div>
-            <div class="stat-box"><div class="stat-label">Signal Line</div><div class="stat-val" id="d-macd-sig">-</div></div>
-          </div>
-          <div class="stat-box">
-            <div class="stat-label">Bollinger Band Position</div>
-            <div class="stat-val" id="d-bb-pos">-</div>
-            <div class="prog-bg"><div class="prog-fill" id="d-bb-bar" style="width:50%;background:#a78bfa"></div></div>
-            <div style="display:flex;justify-content:space-between;margin-top:4px;color:var(--dim);font-size:9px">
-              <span id="d-bb-low">Lower</span><span id="d-bb-up">Upper</span>
-            </div>
-          </div>
-          <div class="section-title">Volume</div>
-          <div class="grid2">
-            <div class="stat-box"><div class="stat-label">Today Vol</div><div class="stat-val b" id="d-vol">-</div></div>
-            <div class="stat-box"><div class="stat-label">90D Avg Vol</div><div class="stat-val" id="d-avgvol">-</div></div>
-          </div>
-        </div>
-
-        <!-- FUNDAMENTAL TAB -->
-        <div class="tab-content" id="tab-fundamental">
-          <div id="fund-loading" style="color:var(--dim);padding:20px;text-align:center">
-            <span class="spinner"></span> Loading fundamentals...
-          </div>
-          <div id="fund-content" style="display:none">
-            <div class="section-title">Valuation</div>
-            <div class="grid3">
-              <div class="stat-box"><div class="stat-label">P/E Ratio</div><div class="stat-val" id="f-pe">-</div></div>
-              <div class="stat-box"><div class="stat-label">P/B Ratio</div><div class="stat-val b" id="f-pb">-</div></div>
-              <div class="stat-box"><div class="stat-label">Market Cap</div><div class="stat-val p" id="f-mcap">-</div></div>
-            </div>
-            <div class="section-title">Growth</div>
-            <div class="grid2">
-              <div class="stat-box"><div class="stat-label">Revenue Growth</div><div class="stat-val" id="f-revg">-</div></div>
-              <div class="stat-box"><div class="stat-label">Earnings Growth</div><div class="stat-val" id="f-earng">-</div></div>
-              <div class="stat-box"><div class="stat-label">Profit Margin</div><div class="stat-val" id="f-margin">-</div></div>
-              <div class="stat-box"><div class="stat-label">Beta</div><div class="stat-val a" id="f-beta">-</div></div>
-            </div>
-            <div class="section-title">Dividends</div>
-            <div class="grid2">
-              <div class="stat-box"><div class="stat-label">Yield</div><div class="stat-val g" id="f-yield">-</div></div>
-              <div class="stat-box"><div class="stat-label">Annual Rate</div><div class="stat-val" id="f-rate">-</div></div>
-              <div class="stat-box"><div class="stat-label">Ex-Date</div><div class="stat-val a" id="f-exdate">-</div></div>
-              <div class="stat-box"><div class="stat-label">Last Dividend</div><div class="stat-val" id="f-lastdiv">-</div></div>
-            </div>
-            <div class="section-title">Dividend History</div>
-            <div id="f-divhist"></div>
-          </div>
-        </div>
-
-        <!-- CORPORATE TAB -->
-        <div class="tab-content" id="tab-corporate">
-          <div id="corp-loading" style="color:var(--dim);padding:20px;text-align:center">
-            <span class="spinner"></span> Loading corporate data...
-          </div>
-          <div id="corp-content" style="display:none">
-            <div class="section-title">Corporate Signal</div>
-            <div class="corp-signal" id="c-signal">-</div>
-            <div id="c-flags"></div>
-            <div id="c-reasons"></div>
-            <div class="section-title">Earnings Calendar</div>
-            <div class="grid2">
-              <div class="stat-box"><div class="stat-label">Next Results</div><div class="stat-val a" id="c-nextdate" style="font-size:11px">-</div></div>
-              <div class="stat-box"><div class="stat-label">EPS Surprise</div><div class="stat-val" id="c-surprise">-</div></div>
-            </div>
-            <div class="section-title">EPS History (Last 4 Quarters)</div>
-            <div id="c-epshist"></div>
-            <div class="section-title">Shareholding</div>
-            <div class="grid3">
-              <div class="stat-box"><div class="stat-label">Promoter</div><div class="stat-val g" id="c-promoter">-</div></div>
-              <div class="stat-box"><div class="stat-label">Institution</div><div class="stat-val b" id="c-inst">-</div></div>
-              <div class="stat-box"><div class="stat-label">Public</div><div class="stat-val" id="c-public">-</div></div>
-            </div>
-            <div class="section-title">Top Institutional Holders</div>
-            <div id="c-institutions"></div>
-          </div>
-        </div>
-
-        <!-- COMPANY TAB -->
-        <div class="tab-content" id="tab-company">
-          <div id="comp-loading" style="color:var(--dim);padding:20px;text-align:center">
-            <span class="spinner"></span> Loading company info...
-          </div>
-          <div id="comp-content" style="display:none">
-            <div class="section-title">Company Profile</div>
-            <div class="grid2">
-              <div class="stat-box"><div class="stat-label">Industry</div><div class="stat-val" id="co-industry" style="font-size:11px">-</div></div>
-              <div class="stat-box"><div class="stat-label">Country</div><div class="stat-val" id="co-country">-</div></div>
-              <div class="stat-box"><div class="stat-label">Employees</div><div class="stat-val b" id="co-emp">-</div></div>
-              <div class="stat-box"><div class="stat-label">Website</div><div class="stat-val" id="co-web" style="font-size:10px">-</div></div>
-            </div>
-            <div class="section-title">About</div>
-            <div id="co-desc" style="font-size:11px;color:var(--text);line-height:1.7;background:var(--bg);padding:10px;border-radius:3px;border:1px solid var(--border)">-</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
 </div>
 <script>
 var secChart={{ sector_chart|safe }};
@@ -682,16 +600,227 @@ var movChart={{ movers_chart|safe }};
 Plotly.newPlot('sec-chart',secChart.data,secChart.layout,{displayModeBar:false,responsive:true});
 Plotly.newPlot('mov-chart',movChart.data,movChart.layout,{displayModeBar:false,responsive:true});
 
-var currentSym=null, corpData=null;
-
-// Live clock
+// Live clock — must format in Asia/Kolkata explicitly, otherwise the browser's
+// own local timezone gets applied on top and the displayed time drifts.
 setInterval(()=>{
-  const now=new Date();
-  const ist=new Date(now.getTime()+(5.5*60*60*1000));
-  document.getElementById('navTime').textContent=ist.toLocaleString('en-IN',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})+' IST';
+  document.getElementById('navTime').textContent=new Date().toLocaleString('en-IN',{
+    day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',
+    hour12:false,timeZone:'Asia/Kolkata'
+  })+' IST';
 },1000);
 
-// Tab switching
+// Search
+function filterTable(){
+  const q=document.getElementById('searchBox').value.toLowerCase();
+  document.querySelectorAll('#stockBody tr').forEach(row=>{
+    const match=row.dataset.sym.toLowerCase().includes(q)||row.dataset.name.toLowerCase().includes(q)||row.dataset.sector.toLowerCase().includes(q);
+    row.style.display=match?'':'none';
+  });
+}
+
+// Sort
+let sortDir={};
+function sortTable(col){
+  const rows=Array.from(document.querySelectorAll('#stockBody tr'));
+  const dir=sortDir[col]===1?-1:1;
+  sortDir[col]=dir;
+  rows.sort((a,b)=>{
+    const av=a.dataset[col]||'';
+    const bv=b.dataset[col]||'';
+    if(!isNaN(av)&&!isNaN(bv)) return dir*(parseFloat(av)-parseFloat(bv));
+    return dir*av.localeCompare(bv);
+  });
+  const tbody=document.getElementById('stockBody');
+  rows.forEach(r=>tbody.appendChild(r));
+}
+</script>
+</body>
+</html>"""
+
+DETAIL_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ symbol.replace('.NS','') }} — Nifty 150 Terminal</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+""" + BASE_STYLE + r"""
+body{min-height:100vh;}
+.page{max-width:1100px;margin:0 auto;padding:20px 24px 60px;}
+.detail-header{padding:16px 0;border-bottom:1px solid var(--border);margin-bottom:16px;}
+.detail-sym{font-size:24px;font-weight:700;color:var(--bright);}
+.detail-name{color:var(--dim);font-size:12px;margin-top:3px;}
+.detail-price{display:flex;align-items:baseline;gap:12px;margin-top:10px;}
+.price{font-size:32px;font-weight:700;color:var(--bright);}
+.chg{font-size:16px;font-weight:700;}
+.detail-tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:16px;}
+.tab{padding:10px 18px;cursor:pointer;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);border-bottom:2px solid transparent;transition:all .2s;}
+.tab:hover{color:var(--bright);}
+.tab.active{color:var(--blue);border-bottom-color:var(--blue);}
+.tab-content{display:none;}
+.tab-content.active{display:block;}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px;}
+.grid4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:10px;}
+@media(max-width:800px){.grid3,.grid4{grid-template-columns:1fr 1fr}}
+@media(max-width:520px){.grid2,.grid3,.grid4{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<nav class="nav">
+  <div class="nav-brand">
+    <a href="/" class="brand-name"><div class="dot" style="display:inline-block;vertical-align:middle;margin-right:8px"></div>NIFTY 150 TERMINAL</a>
+  </div>
+  <div class="nav-links">
+    <a href="/" class="nav-back">← Dashboard</a>
+    <div class="nav-meta" id="navTime">{{ ist_time }}</div>
+  </div>
+</nav>
+<div class="page">
+  <div class="detail-header">
+    <div class="detail-sym">{{ symbol.replace('.NS','') }}</div>
+    <div class="detail-name">{{ name }} · {{ sector }}</div>
+    <div class="detail-price">
+      <span class="price" id="detailPrice">-</span>
+      <span class="chg" id="detailChg">-</span>
+    </div>
+  </div>
+  <div class="detail-tabs">
+    <div class="tab active" onclick="switchTab('technical')">Technical</div>
+    <div class="tab" onclick="switchTab('fundamental')">Fundamental</div>
+    <div class="tab" onclick="switchTab('corporate')">Corporate</div>
+    <div class="tab" onclick="switchTab('company')">Company</div>
+  </div>
+
+  <!-- TECHNICAL TAB -->
+  <div class="tab-content active" id="tab-technical">
+    <div id="detailChart" style="height:380px"></div>
+    <div class="section-title">Today's Trading</div>
+    <div class="grid4">
+      <div class="stat-box"><div class="stat-label">Open</div><div class="stat-val" id="d-open">-</div></div>
+      <div class="stat-box"><div class="stat-label">High</div><div class="stat-val g" id="d-high">-</div></div>
+      <div class="stat-box"><div class="stat-label">Low</div><div class="stat-val r" id="d-low">-</div></div>
+      <div class="stat-box"><div class="stat-label">Prev Close</div><div class="stat-val" id="d-prev">-</div></div>
+      <div class="stat-box"><div class="stat-label">52W High</div><div class="stat-val g" id="d-52h">-</div></div>
+      <div class="stat-box"><div class="stat-label">52W Low</div><div class="stat-val r" id="d-52l">-</div></div>
+      <div class="stat-box"><div class="stat-label">Today Vol</div><div class="stat-val b" id="d-vol">-</div></div>
+      <div class="stat-box"><div class="stat-label">90D Avg Vol</div><div class="stat-val" id="d-avgvol">-</div></div>
+    </div>
+    <div class="section-title">Indicators</div>
+    <div class="grid4">
+      <div class="stat-box">
+        <div class="stat-label">Trend (EMA20 vs EMA50)</div>
+        <div class="stat-val" id="d-trend">-</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">RSI (14)</div>
+        <div class="stat-val" id="d-rsi">-</div>
+        <div class="prog-bg"><div class="prog-fill" id="d-rsi-bar" style="width:50%;background:#38bdf8"></div></div>
+      </div>
+      <div class="stat-box"><div class="stat-label">EMA 20</div><div class="stat-val b" id="d-ema20">-</div></div>
+      <div class="stat-box"><div class="stat-label">EMA 50</div><div class="stat-val a" id="d-ema50">-</div></div>
+      <div class="stat-box"><div class="stat-label">MACD</div><div class="stat-val" id="d-macd">-</div></div>
+      <div class="stat-box"><div class="stat-label">Signal Line</div><div class="stat-val" id="d-macd-sig">-</div></div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Bollinger Band Position</div>
+      <div class="stat-val" id="d-bb-pos">-</div>
+      <div class="prog-bg"><div class="prog-fill" id="d-bb-bar" style="width:50%;background:#a78bfa"></div></div>
+      <div style="display:flex;justify-content:space-between;margin-top:4px;color:var(--dim);font-size:10px">
+        <span id="d-bb-low">Lower</span><span id="d-bb-up">Upper</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- FUNDAMENTAL TAB -->
+  <div class="tab-content" id="tab-fundamental">
+    <div id="fund-loading" style="color:var(--dim);padding:20px;text-align:center">
+      <span class="spinner"></span> Loading fundamentals...
+    </div>
+    <div id="fund-content" style="display:none">
+      <div class="section-title">Valuation</div>
+      <div class="grid3">
+        <div class="stat-box"><div class="stat-label">P/E Ratio</div><div class="stat-val" id="f-pe">-</div></div>
+        <div class="stat-box"><div class="stat-label">P/B Ratio</div><div class="stat-val b" id="f-pb">-</div></div>
+        <div class="stat-box"><div class="stat-label">Market Cap</div><div class="stat-val p" id="f-mcap">-</div></div>
+      </div>
+      <div class="section-title">Growth</div>
+      <div class="grid4">
+        <div class="stat-box"><div class="stat-label">Revenue Growth</div><div class="stat-val" id="f-revg">-</div></div>
+        <div class="stat-box"><div class="stat-label">Earnings Growth</div><div class="stat-val" id="f-earng">-</div></div>
+        <div class="stat-box"><div class="stat-label">Profit Margin</div><div class="stat-val" id="f-margin">-</div></div>
+        <div class="stat-box"><div class="stat-label">Beta</div><div class="stat-val a" id="f-beta">-</div></div>
+      </div>
+      <div class="section-title">Dividends</div>
+      <div class="grid4">
+        <div class="stat-box"><div class="stat-label">Yield</div><div class="stat-val g" id="f-yield">-</div></div>
+        <div class="stat-box"><div class="stat-label">Annual Rate</div><div class="stat-val" id="f-rate">-</div></div>
+        <div class="stat-box"><div class="stat-label">Ex-Date</div><div class="stat-val a" id="f-exdate">-</div></div>
+        <div class="stat-box"><div class="stat-label">Last Dividend</div><div class="stat-val" id="f-lastdiv">-</div></div>
+      </div>
+      <div class="section-title">Dividend History</div>
+      <div id="f-divhist"></div>
+    </div>
+  </div>
+
+  <!-- CORPORATE TAB -->
+  <div class="tab-content" id="tab-corporate">
+    <div id="corp-loading" style="color:var(--dim);padding:20px;text-align:center">
+      <span class="spinner"></span> Loading corporate data...
+    </div>
+    <div id="corp-content" style="display:none">
+      <div class="section-title">Corporate Signal</div>
+      <div class="corp-signal" id="c-signal">-</div>
+      <div id="c-flags"></div>
+      <div id="c-reasons"></div>
+      <div class="section-title">Earnings Calendar</div>
+      <div class="grid2">
+        <div class="stat-box"><div class="stat-label">Next Results</div><div class="stat-val a" id="c-nextdate" style="font-size:12px">-</div></div>
+        <div class="stat-box"><div class="stat-label">EPS Surprise</div><div class="stat-val" id="c-surprise">-</div></div>
+      </div>
+      <div class="section-title">EPS History (Last 4 Quarters)</div>
+      <div id="c-epshist"></div>
+      <div class="section-title">Shareholding</div>
+      <div class="grid3">
+        <div class="stat-box"><div class="stat-label">Promoter</div><div class="stat-val g" id="c-promoter">-</div></div>
+        <div class="stat-box"><div class="stat-label">Institution</div><div class="stat-val b" id="c-inst">-</div></div>
+        <div class="stat-box"><div class="stat-label">Public</div><div class="stat-val" id="c-public">-</div></div>
+      </div>
+      <div class="section-title">Top Institutional Holders</div>
+      <div id="c-institutions"></div>
+    </div>
+  </div>
+
+  <!-- COMPANY TAB -->
+  <div class="tab-content" id="tab-company">
+    <div id="comp-loading" style="color:var(--dim);padding:20px;text-align:center">
+      <span class="spinner"></span> Loading company info...
+    </div>
+    <div id="comp-content" style="display:none">
+      <div class="section-title">Company Profile</div>
+      <div class="grid4">
+        <div class="stat-box"><div class="stat-label">Industry</div><div class="stat-val" id="co-industry" style="font-size:12px">-</div></div>
+        <div class="stat-box"><div class="stat-label">Country</div><div class="stat-val" id="co-country">-</div></div>
+        <div class="stat-box"><div class="stat-label">Employees</div><div class="stat-val b" id="co-emp">-</div></div>
+        <div class="stat-box"><div class="stat-label">Website</div><div class="stat-val" id="co-web" style="font-size:11px">-</div></div>
+      </div>
+      <div class="section-title">About</div>
+      <div id="co-desc" style="font-size:12px;color:var(--text);line-height:1.7;background:var(--bg);padding:12px;border-radius:3px;border:1px solid var(--border)">-</div>
+    </div>
+  </div>
+</div>
+<script>
+const sym="{{ symbol }}";
+
+// Live clock — see comment in dashboard template re: explicit timeZone.
+setInterval(()=>{
+  document.getElementById('navTime').textContent=new Date().toLocaleString('en-IN',{
+    day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',
+    hour12:false,timeZone:'Asia/Kolkata'
+  })+' IST';
+},1000);
+
 function switchTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
@@ -699,34 +828,18 @@ function switchTab(name){
   document.getElementById(`tab-${name}`).classList.add('active');
 }
 
-// Select stock
-async function selectStock(sym, name){
-  currentSym=sym;
-  document.querySelectorAll('tbody tr').forEach(r=>r.classList.remove('active'));
-  const row=document.querySelector(`tr[data-sym="${sym}"]`);
-  if(row) row.classList.add('active');
-  document.getElementById('emptyDetail').style.display='none';
-  const det=document.getElementById('stockDetail');
-  det.style.display='flex';
-  document.getElementById('detailSym').textContent=sym.replace('.NS','');
-  document.getElementById('detailName').textContent=name;
-  document.getElementById('detailPrice').textContent='...';
+async function loadChart(){
+  try{
+    const r=await fetch(`/api/chart/${sym}`);
+    const data=await r.json();
+    if(data.chart){
+      const fig=JSON.parse(data.chart);
+      Plotly.newPlot('detailChart',fig.data,fig.layout,{displayModeBar:false,responsive:true});
+    }
+  }catch(e){}
+}
 
-  // Reset loading states
-  document.getElementById('fund-loading').style.display='block';
-  document.getElementById('fund-content').style.display='none';
-  document.getElementById('corp-loading').style.display='block';
-  document.getElementById('corp-content').style.display='none';
-  document.getElementById('comp-loading').style.display='block';
-  document.getElementById('comp-content').style.display='none';
-
-  // Switch to technical tab
-  switchTab('technical');
-
-  // Load chart
-  loadChart(sym);
-
-  // Load technical data
+async function loadTechnical(){
   try{
     const r=await fetch(`/api/stock/${sym}`);
     const d=await r.json();
@@ -763,27 +876,12 @@ async function selectStock(sym, name){
     document.getElementById('d-vol').textContent=`${(d.volume/1e6).toFixed(1)}M`;
     document.getElementById('d-avgvol').textContent=`${d.avg_volume}M`;
   }catch(e){console.error(e);}
-
-  // Load corporate data (for all tabs)
-  loadCorporate(sym);
 }
 
-async function loadChart(sym){
-  try{
-    const r=await fetch(`/api/chart/${sym}`);
-    const data=await r.json();
-    if(data.chart){
-      const fig=JSON.parse(data.chart);
-      Plotly.newPlot('detailChart',fig.data,fig.layout,{displayModeBar:false,responsive:true});
-    }
-  }catch(e){}
-}
-
-async function loadCorporate(sym){
+async function loadCorporate(){
   try{
     const r=await fetch(`/api/corporate/${sym}`);
     const d=await r.json();
-    corpData=d;
     if(d.error){
       document.getElementById('fund-loading').textContent='⚠️ '+d.error;
       document.getElementById('corp-loading').textContent='⚠️ '+d.error;
@@ -815,7 +913,6 @@ async function loadCorporate(sym){
     document.getElementById('f-exdate').textContent=dv.ex_date||'N/A';
     document.getElementById('f-lastdiv').textContent=dv.last_amount?`₹${dv.last_amount}`:'N/A';
 
-    // Dividend history
     const divH=document.getElementById('f-divhist');
     if(dv.history&&dv.history.length>0){
       divH.innerHTML=dv.history.map(h=>`<div class="hist-row"><span style="color:var(--dim)">${h.date}</span><span style="color:#34d399">₹${h.amount}</span></div>`).join('');
@@ -847,10 +944,9 @@ async function loadCorporate(sym){
     surpriseEl.textContent=e.eps_surprise_pct!=null?`${e.eps_surprise_pct.toFixed(1)}%`:'N/A';
     surpriseEl.style.color=(e.eps_surprise_pct||0)>0?'#34d399':'#f87171';
 
-    // EPS history
     const epsH=document.getElementById('c-epshist');
     if(e.history&&e.history.length>0){
-      epsH.innerHTML=`<div style="background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:8px">
+      epsH.innerHTML=`<div style="background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:10px">
         <div class="hist-row" style="color:var(--dim)"><span>Date</span><span>Estimate</span><span>Actual</span><span>Beat?</span></div>
         ${e.history.map(h=>{const beat=h.actual>=h.estimate;return`<div class="hist-row"><span>${h.date}</span><span>${h.estimate.toFixed(2)}</span><span style="color:${beat?'#34d399':'#f87171'}">${h.actual.toFixed(2)}</span><span>${beat?'✅':'❌'}</span></div>`;}).join('')}
       </div>`;
@@ -858,14 +954,13 @@ async function loadCorporate(sym){
       epsH.innerHTML='<div style="color:var(--dim);font-size:11px">No earnings history</div>';
     }
 
-    // Holders
     const h=d.holders||{};
     document.getElementById('c-promoter').textContent=h.promoter_pct||'N/A';
     document.getElementById('c-inst').textContent=h.institution_pct||'N/A';
     document.getElementById('c-public').textContent=h.public_pct||'N/A';
     const instEl=document.getElementById('c-institutions');
     if(h.top_institutions&&h.top_institutions.length>0){
-      instEl.innerHTML=`<div style="background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:8px">
+      instEl.innerHTML=`<div style="background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:10px">
         ${h.top_institutions.map(i=>`<div class="hist-row"><span style="color:var(--text);max-width:70%;overflow:hidden;text-overflow:ellipsis">${i.name}</span><span style="color:#38bdf8">${i.pct}%</span></div>`).join('')}
       </div>`;
     } else {
@@ -896,36 +991,9 @@ async function loadCorporate(sym){
   }
 }
 
-// Search
-function filterTable(){
-  const q=document.getElementById('searchBox').value.toLowerCase();
-  document.querySelectorAll('#stockBody tr').forEach(row=>{
-    const match=row.dataset.sym.toLowerCase().includes(q)||row.dataset.name.toLowerCase().includes(q)||row.dataset.sector.toLowerCase().includes(q);
-    row.style.display=match?'':'none';
-  });
-}
-
-// Sort
-let sortDir={};
-function sortTable(col){
-  const rows=Array.from(document.querySelectorAll('#stockBody tr'));
-  const dir=sortDir[col]===1?-1:1;
-  sortDir[col]=dir;
-  rows.sort((a,b)=>{
-    const av=a.dataset[col]||'';
-    const bv=b.dataset[col]||'';
-    if(!isNaN(av)&&!isNaN(bv)) return dir*(parseFloat(av)-parseFloat(bv));
-    return dir*av.localeCompare(bv);
-  });
-  const tbody=document.getElementById('stockBody');
-  rows.forEach(r=>tbody.appendChild(r));
-}
-
-// Auto-click first row
-window.onload=()=>{
-  const first=document.querySelector('#stockBody tr');
-  if(first) first.click();
-};
+loadChart();
+loadTechnical();
+loadCorporate();
 </script>
 </body>
 </html>"""
