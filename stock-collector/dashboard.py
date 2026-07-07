@@ -19,6 +19,7 @@ from flask import Flask, render_template_string, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from config import get_watchlist
 from src.database import init_db
 from src.collector import collect_historical
 
@@ -39,6 +40,20 @@ def get_conn():
 def ist_now():
     ist = timezone(timedelta(hours=5, minutes=30))
     return datetime.now(ist).strftime("%d %b %Y · %H:%M:%S IST")
+
+
+def _no_bdata(df, *cols):
+    """Cast numeric columns to object dtype before handing a DataFrame to
+    plotly.express. Plotly compacts numeric numpy arrays into a
+    {"dtype","bdata"} binary format at trace-construction time that the
+    Plotly.js CDN build loaded client-side can't decode (silently renders
+    garbage instead of the chart) — object-dtype columns aren't numeric
+    arrays in Plotly's eyes, so they're serialized as plain JSON instead.
+    See the same fix applied directly in api_chart() for go.Figure traces."""
+    df = df.copy()
+    for col in cols:
+        df[col] = df[col].astype(object)
+    return df
 
 
 PLOTLY_DARK = dict(
@@ -320,18 +335,17 @@ def get_stock_detail(symbol):
 # IST daily for as long as this process keeps running. Only price_history needs
 # refreshing here — fundamentals/corporate data are fetched live per-request via
 # /api/corporate/<symbol> already, not read from the DB.
-def _watchlist_from_db():
-    with get_conn() as c:
-        rows = c.execute("SELECT symbol, name, sector FROM stocks").fetchall()
-    return [{"symbol": r["symbol"], "name": r["name"], "sector": r["sector"]} for r in rows]
-
-
 def _run_daily_refresh():
     try:
         init_db(DB_PATH)
-        watchlist = _watchlist_from_db()
+        # Uses config.py's symbol list (not just whatever's already in the DB) so a
+        # newly-added ticker gets seeded automatically on the next refresh instead
+        # of needing a separate manual backfill step. Relies on the committed
+        # nifty_150_cache.json being fresh (<24h old) so this stays a cache hit,
+        # not a ~150-symbol live metadata fetch, on every boot.
+        watchlist = get_watchlist(cache_ok=True)
         if not watchlist:
-            logger.warning("[daily_refresh] no watchlist in DB yet, skipping")
+            logger.warning("[daily_refresh] empty watchlist, skipping")
             return
         logger.info("[daily_refresh] pulling latest session for %d symbols ...", len(watchlist))
         collect_historical(DB_PATH, watchlist, period="1y")
@@ -372,16 +386,23 @@ def api_chart(symbol):
     ema20 = close.ewm(span=20).mean()
     ema50 = close.ewm(span=50).mean()
 
+    # Plotly compacts numpy-backed trace data into a {"dtype","bdata"} binary
+    # array format at trace-construction time (not at JSON-dump time, so
+    # fixing it after the fact doesn't work) — the Plotly.js CDN build we
+    # load client-side is too old to decode that format and silently
+    # renders garbage instead of the real chart. Passing plain Python lists
+    # (and date strings, not Timestamps) avoids that code path entirely.
+    dates = hist["date"].dt.strftime("%Y-%m-%d").tolist()
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
-        x=hist["date"], open=hist["open"], high=hist["high"],
-        low=hist["low"], close=hist["close"], name="OHLC",
+        x=dates, open=hist["open"].tolist(), high=hist["high"].tolist(),
+        low=hist["low"].tolist(), close=hist["close"].tolist(), name="OHLC",
         increasing_line_color="#34d399", decreasing_line_color="#f87171",
         increasing_fillcolor="#34d399", decreasing_fillcolor="#f87171",
     ))
-    fig.add_trace(go.Scatter(x=hist["date"], y=ema20, name="EMA20",
+    fig.add_trace(go.Scatter(x=dates, y=ema20.tolist(), name="EMA20",
         line=dict(color="#38bdf8", width=1.2), opacity=0.8))
-    fig.add_trace(go.Scatter(x=hist["date"], y=ema50, name="EMA50",
+    fig.add_trace(go.Scatter(x=dates, y=ema50.tolist(), name="EMA50",
         line=dict(color="#fbbf24", width=1.2), opacity=0.8))
     fig.update_layout(height=280, xaxis_rangeslider_visible=False,
         title=dict(text=f"{symbol} — 90 Day Chart", font=dict(color="#d1d5db", size=12)),
@@ -559,7 +580,7 @@ def index():
         records = c.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
 
     sec = df.groupby("sector").agg(count=("symbol", "count"), avg_close=("close", "mean")).reset_index()
-    sec_fig = px.bar(sec, x="sector", y="count", color="avg_close",
+    sec_fig = px.bar(_no_bdata(sec, "count", "avg_close"), x="sector", y="count", color="avg_close",
                      color_continuous_scale=["#1e3a5f", "#38bdf8"])
     sec_fig.update_layout(xaxis_tickangle=-35, xaxis_title="", yaxis_title="",
                           coloraxis_showscale=False, **PLOTLY_DARK)
@@ -568,7 +589,7 @@ def index():
     top_g = df.nlargest(8, "day_chg")[["symbol", "day_chg"]].assign(type="Gainer")
     top_l = df.nsmallest(8, "day_chg")[["symbol", "day_chg"]].assign(type="Loser")
     movers = pd.concat([top_g, top_l])
-    mov_fig = px.bar(movers, y="symbol", x="day_chg", color="type", orientation="h",
+    mov_fig = px.bar(_no_bdata(movers, "day_chg"), y="symbol", x="day_chg", color="type", orientation="h",
                      color_discrete_map={"Gainer": "#34d399", "Loser": "#f87171"})
     mov_fig.update_layout(xaxis_title="", yaxis_title="", showlegend=False,
                           margin=dict(t=10, b=10, l=80, r=20),
@@ -581,7 +602,7 @@ def index():
     breadth = get_market_breadth(df_all)
     rotation = get_sector_rotation(df_all)
 
-    rot_fig = px.bar(rotation.sort_values("chg_20d"), y="sector", x="chg_20d", orientation="h",
+    rot_fig = px.bar(_no_bdata(rotation.sort_values("chg_20d"), "chg_20d"), y="sector", x="chg_20d", orientation="h",
                      color="chg_20d", color_continuous_scale=["#f87171", "#6b7280", "#34d399"],
                      color_continuous_midpoint=0)
     rot_fig.update_layout(xaxis_title="", yaxis_title="", showlegend=False,
