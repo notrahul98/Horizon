@@ -26,6 +26,8 @@ from agents.claude_agent import ClaudeAgent
 from agents.gemini_agent import GeminiAgent
 from agents.deepseek_agent import DeepSeekAgent
 from agents.consensus_engine import ConsensusEngine
+from scanner import scan_for_candidates, format_daily_report
+from notifications import send_telegram, telegram_enabled
 
 # Phase 4: multi-agent consensus. No ANTHROPIC_API_KEY/GEMINI_API_KEY/DEEPSEEK_API_KEY
 # are wired up (that's a real integration with real cost, not something to switch on
@@ -413,6 +415,38 @@ def _run_daily_refresh():
         logger.exception("[daily_refresh] failed")
 
 
+# ── Phase 5: daily Telegram report ───────────────────────────────
+# Runs 10 minutes after the price refresh (16:10 IST) so it's screening
+# against that day's data, not yesterday's. Telegram only for now (see
+# notifications.py); email/SMS need paid/credentialed services that
+# weren't set up. If TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID aren't set, this
+# logs what it would have sent instead of failing the job.
+def _run_daily_alert():
+    try:
+        df = get_latest_df()
+        if df.empty:
+            logger.warning("[daily_alert] no data yet, skipping")
+            return
+
+        df_all = get_all_daily_history()
+        breadth, _, _ = get_market_breadth(df_all)
+        symbols = df["symbol"].tolist()
+
+        candidates = scan_for_candidates(symbols, get_stock_detail, get_history, get_ai_consensus)
+        report = format_daily_report(
+            candidates=candidates,
+            breadth=breadth,
+            total_stocks=len(df),
+            gainers=int((df["day_chg"] > 0).sum()),
+            losers=int((df["day_chg"] < 0).sum()),
+            latest_date=df["date"].max(),
+        )
+        logger.info("[daily_alert] %d candidates found, sending report ...", len(candidates))
+        send_telegram(report)
+    except Exception:
+        logger.exception("[daily_alert] failed")
+
+
 def _start_scheduler():
     threading.Thread(target=_run_daily_refresh, daemon=True).start()
 
@@ -421,6 +455,13 @@ def _start_scheduler():
         _run_daily_refresh,
         CronTrigger(day_of_week="mon-fri", hour=16, minute=0),
         id="daily_refresh",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    sched.add_job(
+        _run_daily_alert,
+        CronTrigger(day_of_week="mon-fri", hour=16, minute=10),
+        id="daily_alert",
         max_instances=1,
         misfire_grace_time=3600,
     )
@@ -442,6 +483,32 @@ def api_consensus(symbol):
     if consensus is None:
         return jsonify({"error": "No data"})
     return jsonify(consensus)
+
+
+@app.route("/api/send-report", methods=["POST"])
+def api_send_report():
+    """Manual trigger for testing the Phase 5 daily report without waiting
+    for the 16:10 IST schedule. POST-only since it has a side effect
+    (sends a Telegram message if configured)."""
+    df = get_latest_df()
+    if df.empty:
+        return jsonify({"error": "No data yet"}), 503
+
+    df_all = get_all_daily_history()
+    breadth, _, _ = get_market_breadth(df_all)
+    candidates = scan_for_candidates(df["symbol"].tolist(), get_stock_detail, get_history, get_ai_consensus)
+    report = format_daily_report(
+        candidates=candidates, breadth=breadth, total_stocks=len(df),
+        gainers=int((df["day_chg"] > 0).sum()), losers=int((df["day_chg"] < 0).sum()),
+        latest_date=df["date"].max(),
+    )
+    sent = send_telegram(report)
+    return jsonify({
+        "telegram_configured": telegram_enabled(),
+        "sent": sent,
+        "candidates_found": len(candidates),
+        "report_preview": report,
+    })
 
 
 @app.route("/api/chart/<symbol>")

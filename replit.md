@@ -37,6 +37,13 @@ The dashboard's KPI cards (Gainers, Losers, Top Gainer, Near 52W High/Low) are c
 
 **Daily auto-refresh, no persistent volume required**: Railway's filesystem is ephemeral (no volume attached), so instead of relying on `main.py`'s standalone scheduler, `dashboard.py` runs its own lightweight background job on import — via `APScheduler`'s `BackgroundScheduler` plus a `threading.Thread` for the immediate on-boot run. On every process start it immediately refreshes `price_history` from yfinance (whatever session Yahoo has most recently published), then repeats that at 16:00 IST on weekdays for as long as the process stays up. Only `price_history` is refreshed this way — `fundamentals` and corporate data are fetched live per-request already, so they don't need a stored copy. See `_start_scheduler()` in `dashboard.py`.
 
+**Phase 5 — daily Telegram report (16:10 IST weekdays, 10 min after the price refresh)**: `scanner.py` runs a rule-based swing-trade screen (same style as the Phase 4 agents' offline heuristics, not a prediction model) over every tracked stock — AI consensus BUY with HIGH/MEDIUM conviction and ≥55% confidence, trend alignment (close > EMA20 > EMA50), RSI < 70 — and for anything that clears it, derives a stop-loss/target from ATR(14) (stop = entry − 1.5×ATR, target = entry + 2.5×risk). `notifications.py` sends the formatted report via Telegram. **Only Telegram is wired up** — email/SMS need paid or credentialed services that weren't requested. To activate:
+1. Message [@BotFather](https://t.me/BotFather) on Telegram → `/newbot` → get a bot token.
+2. Message your new bot once (anything), then hit `https://api.telegram.org/bot<TOKEN>/getUpdates` to find your `chat.id`.
+3. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in Railway's environment variables.
+
+Without those two env vars, `send_telegram()` logs what it would have sent instead of failing the job — same graceful-offline pattern as the Phase 4 agents. Test any time via `POST /api/send-report` (returns `report_preview` either way, plus whether it actually sent).
+
 ### Node.js workspace — scaffolding only, not runnable as-is
 `lib/` (db, api-spec, api-zod, api-client-react) and `artifacts/` (api-server, nifty-dashboard, mockup-sandbox) contain an in-progress Node/Postgres/Drizzle rewrite. **It is not wired up**: there is no root `package.json` and no `pnpm-workspace.yaml`, so the `"catalog:"` dependency references in each package's `package.json` don't resolve and `pnpm install` at the repo root will fail. No `DATABASE_URL`/Postgres is actually provisioned or used anywhere yet. Treat this as an unfinished prototype, not a running service — finishing it requires adding the workspace/catalog config and deciding on a Postgres setup before any of the commands below will work:
 - `pnpm --filter @workspace/api-server run dev` — intended to run the API server (port 5000)
@@ -71,6 +78,8 @@ stock-collector/
   agents/            — Phase 4: ClaudeAgent/GeminiAgent/DeepSeekAgent + ConsensusEngine,
                         wired into dashboard.py's /api/consensus/<symbol> and the detail
                         page's "AI Signal" tab. Promoted out of experiments/ (see below).
+  scanner.py          — Phase 5: rule-based swing-trade candidate screen + ATR stop/target
+  notifications.py    — Phase 5: Telegram send (email/SMS not wired up)
 
 experiments/          — parked prototype: technical-analysis + self-learning engine
                         (core/, learning/, reports/). The agents/ subfolder that used to
@@ -94,6 +103,7 @@ experiments/          — parked prototype: technical-analysis + self-learning e
 | Daily OHLCV sync | Mon–Fri at 18:00 IST (post market close) |
 | Fundamentals snapshot | Sunday at 08:00 IST |
 | Corporate actions (Phase 2) | Manual only — run `--corporate`; not on the auto-scheduler yet |
+| Daily Telegram report (Phase 5) | Mon–Fri at 16:10 IST (`dashboard.py`'s own scheduler, not `src/scheduler.py`) |
 
 ## Architecture decisions
 
