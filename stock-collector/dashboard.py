@@ -584,6 +584,87 @@ def api_chart(symbol):
     return jsonify({"chart": json.dumps(fig, cls=PlotlyJSONEncoder)})
 
 
+@app.route("/api/analysts/<symbol>")
+def api_analysts(symbol):
+    """Analyst consensus + price targets + recent news, live from yfinance.
+
+    Note on scope: yfinance's `upgrades_downgrades` (individual named-firm
+    actions, e.g. "Morgan Stanley upgraded to Buy") comes back empty for
+    every Indian stock tested (RELIANCE, TCS, INFY, ETERNAL, IRCTC) — it's
+    just not populated for NSE tickers in Yahoo's data. What *is* reliably
+    available is the aggregate analyst count (`recommendations`) and mean/
+    high/low price targets (`analyst_price_targets`), so that's what this
+    shows — a consensus reading, not per-broker quotes.
+    """
+    import yfinance as yf
+
+    if not symbol.endswith('.NS'):
+        symbol = symbol + '.NS'
+    ticker = yf.Ticker(symbol)
+    result = {'symbol': symbol}
+
+    try:
+        rec = ticker.recommendations
+        periods = []
+        if rec is not None and not rec.empty:
+            for _, row in rec.iterrows():
+                counts = {
+                    'strongBuy': int(row.get('strongBuy', 0) or 0),
+                    'buy': int(row.get('buy', 0) or 0),
+                    'hold': int(row.get('hold', 0) or 0),
+                    'sell': int(row.get('sell', 0) or 0),
+                    'strongSell': int(row.get('strongSell', 0) or 0),
+                }
+                total = sum(counts.values())
+                score = None
+                if total > 0:
+                    weighted = (counts['strongBuy'] * 5 + counts['buy'] * 4 + counts['hold'] * 3
+                                + counts['sell'] * 2 + counts['strongSell'] * 1)
+                    score = round(weighted / total, 2)
+                periods.append({'period': row.get('period', ''), 'total': total, 'score': score, **counts})
+        result['recommendations'] = periods
+    except Exception as e:
+        result['recommendations'] = []
+        result['recommendations_error'] = str(e)
+
+    try:
+        pt = ticker.analyst_price_targets
+        if pt and pt.get('current'):
+            current = pt['current']
+            result['price_targets'] = {
+                'current': current,
+                'mean': pt.get('mean'),
+                'median': pt.get('median'),
+                'high': pt.get('high'),
+                'low': pt.get('low'),
+                'upside_pct': round((pt['mean'] - current) / current * 100, 1) if pt.get('mean') else None,
+            }
+        else:
+            result['price_targets'] = None
+    except Exception as e:
+        result['price_targets'] = None
+        result['price_targets_error'] = str(e)
+
+    try:
+        news_items = ticker.news or []
+        news = []
+        for item in news_items[:10]:
+            content = item.get('content', {})
+            news.append({
+                'title': content.get('title'),
+                'publisher': (content.get('provider') or {}).get('displayName'),
+                'link': (content.get('canonicalUrl') or {}).get('url'),
+                'published': content.get('pubDate'),
+                'summary': (content.get('summary') or '')[:220],
+            })
+        result['news'] = news
+    except Exception as e:
+        result['news'] = []
+        result['news_error'] = str(e)
+
+    return jsonify(result)
+
+
 @app.route("/api/corporate/<symbol>")
 def api_corporate(symbol):
     """Fetch corporate data using yfinance (Yahoo Finance works on Railway)"""
@@ -1158,6 +1239,7 @@ body{min-height:100vh;}
     <div class="tab" onclick="switchTab('corporate')">Corporate</div>
     <div class="tab" onclick="switchTab('company')">Company</div>
     <div class="tab" onclick="switchTab('ai')">AI Signal</div>
+    <div class="tab" onclick="switchTab('analysts')">Analysts & News</div>
   </div>
 
   <!-- TECHNICAL TAB -->
@@ -1305,6 +1387,30 @@ body{min-height:100vh;}
       </div>
       <div class="section-title">Agent Breakdown</div>
       <div class="grid3" id="ai-agent-cards"></div>
+    </div>
+  </div>
+
+  <!-- ANALYSTS & NEWS TAB -->
+  <div class="tab-content" id="tab-analysts">
+    <div id="analysts-loading" style="color:var(--dim);padding:20px;text-align:center">
+      <span class="spinner"></span> Loading analyst data and news...
+    </div>
+    <div id="analysts-content" style="display:none">
+      <div style="font-size:11px;color:var(--dim);background:var(--card);border:1px solid var(--border);padding:8px 12px;border-radius:4px;margin-bottom:12px;">
+        Aggregate analyst consensus and price targets from Yahoo Finance — not individual named-broker quotes (that data isn't populated for Indian stocks).
+      </div>
+      <div class="section-title">Analyst Consensus</div>
+      <div class="corp-signal" id="an-consensus-signal">-</div>
+      <div id="an-rec-bars"></div>
+      <div class="section-title">Price Targets</div>
+      <div class="grid4">
+        <div class="stat-box"><div class="stat-label">Current</div><div class="stat-val" id="an-pt-current">-</div></div>
+        <div class="stat-box"><div class="stat-label">Mean Target</div><div class="stat-val b" id="an-pt-mean">-</div></div>
+        <div class="stat-box"><div class="stat-label">High / Low</div><div class="stat-val" id="an-pt-range">-</div></div>
+        <div class="stat-box"><div class="stat-label">Upside vs Current</div><div class="stat-val" id="an-pt-upside">-</div></div>
+      </div>
+      <div class="section-title">Recent News</div>
+      <div id="an-news"></div>
     </div>
   </div>
 </div>
@@ -1556,10 +1662,95 @@ async function loadAIConsensus(){
   }
 }
 
+async function loadAnalysts(){
+  try{
+    const r=await fetch(`/api/analysts/${sym}`);
+    const d=await r.json();
+
+    // ---- CONSENSUS ----
+    const periods=d.recommendations||[];
+    const latest=periods[0];
+    const sigEl=document.getElementById('an-consensus-signal');
+    if(latest && latest.total>0){
+      let label='Hold', color='#9ca3af';
+      if(latest.score>=4.5){label='Strong Buy';color='#34d399';}
+      else if(latest.score>=3.5){label='Buy';color='#34d399';}
+      else if(latest.score>=2.5){label='Hold';color='#9ca3af';}
+      else if(latest.score>=1.5){label='Sell';color='#f87171';}
+      else {label='Strong Sell';color='#f87171';}
+      sigEl.textContent=`${label}  ·  ${latest.total} analysts  ·  score ${latest.score}/5`;
+      sigEl.style.background=color+'18';
+      sigEl.style.border=`1px solid ${color}44`;
+      sigEl.style.color=color;
+
+      const barsEl=document.getElementById('an-rec-bars');
+      const rows=[
+        {label:'Strong Buy',key:'strongBuy',color:'#34d399'},
+        {label:'Buy',key:'buy',color:'#6ee7b7'},
+        {label:'Hold',key:'hold',color:'#9ca3af'},
+        {label:'Sell',key:'sell',color:'#fca5a5'},
+        {label:'Strong Sell',key:'strongSell',color:'#f87171'},
+      ];
+      barsEl.innerHTML=rows.map(row=>{
+        const count=latest[row.key]||0;
+        const pct=latest.total>0?(count/latest.total*100):0;
+        return `<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+          <span style="width:80px;font-size:11px;color:var(--dim);">${row.label}</span>
+          <div class="prog-bg" style="flex:1;"><div class="prog-fill" style="width:${pct}%;background:${row.color}"></div></div>
+          <span style="width:24px;text-align:right;font-size:11px;">${count}</span>
+        </div>`;
+      }).join('');
+    } else {
+      sigEl.textContent='No analyst coverage found';
+      sigEl.style.background='';
+      sigEl.style.border='1px solid var(--border)';
+      sigEl.style.color='var(--dim)';
+    }
+
+    // ---- PRICE TARGETS ----
+    const pt=d.price_targets;
+    if(pt){
+      document.getElementById('an-pt-current').textContent=`₹${pt.current}`;
+      document.getElementById('an-pt-mean').textContent=pt.mean?`₹${pt.mean}`:'N/A';
+      document.getElementById('an-pt-range').textContent=(pt.high&&pt.low)?`₹${pt.low} – ₹${pt.high}`:'N/A';
+      const upEl=document.getElementById('an-pt-upside');
+      if(pt.upside_pct!=null){
+        upEl.textContent=`${pt.upside_pct>=0?'+':''}${pt.upside_pct}%`;
+        upEl.style.color=pt.upside_pct>=0?'#34d399':'#f87171';
+      } else {
+        upEl.textContent='N/A';
+      }
+    } else {
+      ['an-pt-current','an-pt-mean','an-pt-range','an-pt-upside'].forEach(id=>document.getElementById(id).textContent='N/A');
+    }
+
+    // ---- NEWS ----
+    const newsEl=document.getElementById('an-news');
+    const news=d.news||[];
+    if(news.length===0){
+      newsEl.innerHTML='<div style="color:var(--dim);font-size:11px">No recent news found</div>';
+    } else {
+      newsEl.innerHTML=news.map(n=>`
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:10px 12px;margin-bottom:8px;">
+          <a href="${n.link||'#'}" target="_blank" style="color:var(--bright);font-weight:700;font-size:12px;text-decoration:none;">${n.title||'Untitled'}</a>
+          <div style="color:var(--dim);font-size:10px;margin-top:3px;">${n.publisher||'Unknown source'} ${n.published?'· '+new Date(n.published).toLocaleDateString('en-IN'):''}</div>
+          ${n.summary?`<div style="color:var(--text);font-size:11px;margin-top:6px;line-height:1.5;">${n.summary}...</div>`:''}
+        </div>
+      `).join('');
+    }
+
+    document.getElementById('analysts-loading').style.display='none';
+    document.getElementById('analysts-content').style.display='block';
+  }catch(e){
+    document.getElementById('analysts-loading').textContent='Failed to load: '+e.message;
+  }
+}
+
 loadChart();
 loadTechnical();
 loadCorporate();
 loadAIConsensus();
+loadAnalysts();
 </script>
 </body>
 </html>"""
