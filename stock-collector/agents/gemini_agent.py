@@ -1,5 +1,5 @@
 """
-swing_trader/agents/gemini_agent.py
+stock-collector/agents/gemini_agent.py
 Gemini agent for market sentiment and macro analysis
 """
 

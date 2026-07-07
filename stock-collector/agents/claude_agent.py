@@ -1,5 +1,5 @@
 """
-swing_trader/agents/claude_agent.py
+stock-collector/agents/claude_agent.py
 Claude agent for narrative and risk analysis
 """
 

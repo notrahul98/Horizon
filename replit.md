@@ -31,7 +31,9 @@ python stock-collector/main.py
 ```bash
 python stock-collector/launcher.py   # serves dashboard.py on $PORT (default 20702)
 ```
-Two pages: `/` is the overview (KPIs, sector/movers charts, sortable/searchable stock table); clicking a row goes to `/stock/<symbol>`, a full-width page with Technical / Fundamental / Corporate / Company tabs (previously all four were crammed into one 380px side panel alongside the table on a single page). `dashboard.py` also registers the Phase 2 `corporate_bp` blueprint from `corporate_dashboard.py`, though note the actual `/api/corporate/<symbol>` route the frontend calls is a separate live-yfinance implementation inside `dashboard.py` itself, not the blueprint's `/api/corporate/stock/<symbol>` — the blueprint's routes exist but nothing in the UI calls them.
+Two pages: `/` is the overview (KPIs, sector/movers/rotation charts, sortable/searchable stock table); clicking a row goes to `/stock/<symbol>`, a full-width page with Technical / Fundamental / Corporate / Company / **AI Signal** tabs (previously all four were crammed into one 380px side panel alongside the table on a single page). `dashboard.py` also registers the Phase 2 `corporate_bp` blueprint from `corporate_dashboard.py`, though note the actual `/api/corporate/<symbol>` route the frontend calls is a separate live-yfinance implementation inside `dashboard.py` itself, not the blueprint's `/api/corporate/stock/<symbol>` — the blueprint's routes exist but nothing in the UI calls them.
+
+The dashboard's KPI cards (Gainers, Losers, Top Gainer, Near 52W High/Low) are clickable — each opens a modal listing the matching stocks, click a row to jump to its detail page. "Near 52W High/Low" means within 5% of the stock's own 1-year high/low (`get_market_breadth()`'s `near_pct` param), not a strict all-time touch.
 
 **Daily auto-refresh, no persistent volume required**: Railway's filesystem is ephemeral (no volume attached), so instead of relying on `main.py`'s standalone scheduler, `dashboard.py` runs its own lightweight background job on import — via `APScheduler`'s `BackgroundScheduler` plus a `threading.Thread` for the immediate on-boot run. On every process start it immediately refreshes `price_history` from yfinance (whatever session Yahoo has most recently published), then repeats that at 16:00 IST on weekdays for as long as the process stays up. Only `price_history` is refreshed this way — `fundamentals` and corporate data are fetched live per-request already, so they don't need a stored copy. See `_start_scheduler()` in `dashboard.py`.
 
@@ -66,10 +68,14 @@ stock-collector/
     collector.py     — yfinance fetch logic (historical, intraday, fundamentals)
     scheduler.py     — APScheduler job definitions (IST timezone)
     reporter.py      — tabular console output
+  agents/            — Phase 4: ClaudeAgent/GeminiAgent/DeepSeekAgent + ConsensusEngine,
+                        wired into dashboard.py's /api/consensus/<symbol> and the detail
+                        page's "AI Signal" tab. Promoted out of experiments/ (see below).
 
-experiments/          — parked prototype: multi-agent (Claude/DeepSeek/Gemini) swing-trading
-                        consensus + technical-analysis engine (core/, learning/, agents/, reports/).
-                        Not imported by anything else in the repo — revive deliberately or delete.
+experiments/          — parked prototype: technical-analysis + self-learning engine
+                        (core/, learning/, reports/). The agents/ subfolder that used to
+                        live here moved to stock-collector/agents/ since it's active now.
+                        What remains is not imported by anything — revive deliberately or delete.
 ```
 
 ## Database Schema
@@ -116,3 +122,4 @@ _Populate as you build — explicit user instructions worth remembering across s
 - **Plotly charts must use plain Python lists, not pandas Series/numpy arrays, in every `go.Candlestick`/`go.Scatter`/`px.bar` call.** Plotly compacts numpy-backed numeric data into a `{"dtype":...,"bdata":...}` binary array format at *trace-construction* time (not at JSON-dump time — fixing it after the figure is built doesn't work). The Plotly.js CDN build loaded client-side (2.27.0) can't decode that format and silently renders garbage instead of erroring. Always call `.tolist()` on Series before passing them into a trace, and cast DataFrame columns to `object` dtype (see `_no_bdata()` in `dashboard.py`) before handing them to `plotly.express`.
 - `config.py`'s `_NIFTY_150_SYMBOLS` had 5 tickers that no longer resolve via yfinance due to real corporate actions (verified live, not guessed): `ZOMATO.NS` → renamed `ETERNAL.NS` (2024); `MCDOWELL-N.NS` → renamed `UNITDSPR.NS` (Jun 2024); `GMRINFRA.NS` → renamed `GMRAIRPORT.NS` after a 2024 demerger; `TATAMOTORS.NS` → demerged into `TMCV.NS` (commercial vehicles) and `TMPV.NS` (passenger vehicles + JLR) in late 2025, replaced with `TMPV.NS`; `ZEE.NS` was just a wrong ticker, corrected to `ZEEL.NS`. There was also a duplicate `HDFCBANK.NS` entry. Fixed, plus 5 new symbols added (including `TMCV.NS`) to bring the list to a true 150 unique, all-resolving tickers. If yfinance stops resolving a ticker again in the future, it's almost always a rename/demerger — verify with a quick `yf.Ticker(sym).history(period="5d")` before assuming it's a transient error.
 - `nifty_150_cache.json` must stay fresh (<24h old) for `dashboard.py`'s daily refresh to stay a cache hit — it now sources its watchlist from `config.get_watchlist()` (not just whatever's already in the DB) so newly-added symbols get seeded automatically, but a stale cache means every boot pays for a ~150-symbol live yfinance metadata fetch instead. Regenerate with `get_watchlist(cache_ok=False)` after editing the symbol list.
+- **Phase 4's "AI Signal" tab is not calling any LLM API right now.** `ClaudeAgent`/`GeminiAgent`/`DeepSeekAgent` (`stock-collector/agents/`) each fall back to a rule-based `_offline_analysis()` using EMA20/50/200, RSI, and Bollinger position — real signal from real indicators, just not a live model call. No `ANTHROPIC_API_KEY`/`GEMINI_API_KEY`/`DEEPSEEK_API_KEY` are set. The UI is honest about this (see the amber banner on the tab), and each agent's `analyze()` has a clear spot to plug in a real API call once you're ready to pay for it — set the env var and the offline fallback stops triggering automatically.

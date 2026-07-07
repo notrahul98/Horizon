@@ -22,6 +22,49 @@ from apscheduler.triggers.cron import CronTrigger
 from config import get_watchlist
 from src.database import init_db
 from src.collector import collect_historical
+from agents.claude_agent import ClaudeAgent
+from agents.gemini_agent import GeminiAgent
+from agents.deepseek_agent import DeepSeekAgent
+from agents.consensus_engine import ConsensusEngine
+
+# Phase 4: multi-agent consensus. No ANTHROPIC_API_KEY/GEMINI_API_KEY/DEEPSEEK_API_KEY
+# are wired up (that's a real integration with real cost, not something to switch on
+# silently) - each agent runs its own rule-based technical heuristic instead
+# (see agents/*_agent.py's _offline_analysis()). This is real signal from real
+# indicators, just not an LLM call yet. Set the env vars and pass them below to
+# upgrade an agent to live API analysis without changing anything else.
+_claude_agent = ClaudeAgent(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+_gemini_agent = GeminiAgent(api_key=os.environ.get("GEMINI_API_KEY"))
+_deepseek_agent = DeepSeekAgent(api_key=os.environ.get("DEEPSEEK_API_KEY"))
+_consensus_engine = ConsensusEngine()
+
+
+def get_ai_consensus(detail):
+    """Run all three agents against one stock's technical snapshot and
+    aggregate their votes. `detail` is get_stock_detail()'s return dict."""
+    if not detail:
+        return None
+    technical = {
+        "price": detail["close"],
+        "ema_20": detail["ema20"],
+        "ema_50": detail["ema50"],
+        "ema_200": detail["ema200"] if detail["ema200"] is not None else detail["ema50"],
+        "rsi": detail["rsi"],
+        "bb_upper": detail["bb_upper"],
+        "bb_lower": detail["bb_lower"],
+    }
+    signals = [
+        _claude_agent.analyze(detail, technical),
+        _gemini_agent.analyze(detail, technical),
+        _deepseek_agent.analyze(detail, technical),
+    ]
+    consensus = _consensus_engine.get_consensus(signals)
+    consensus["agents_live"] = {
+        "Claude": _claude_agent.enabled,
+        "Gemini": _gemini_agent.enabled,
+        "DeepSeek": _deepseek_agent.enabled,
+    }
+    return consensus
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "stocks.db")
 app = Flask(__name__)
@@ -107,13 +150,19 @@ def get_all_daily_history():
     return df
 
 
-def get_market_breadth(df_all):
+def get_market_breadth(df_all, near_pct=5.0):
     """Advance/decline plus two breadth reads that need historical context
-    beyond a single day's snapshot: how many stocks are at a genuine new
-    52-week high/low (not just up/down today), and how many are trading
-    above their own 50-day average (a broad rally vs a narrow one)."""
+    beyond a single day's snapshot: how many stocks are *near* (within
+    near_pct%) their own 52-week high/low, and how many are trading above
+    their own 50-day average (a broad rally vs a narrow one).
+
+    Also returns the per-symbol all-time high/low as plain Series so the
+    caller can merge them into the main stock table once, instead of
+    re-deriving them separately for the dashboard's clickable "near 52W
+    high/low" drill-down lists.
+    """
     if df_all.empty:
-        return {}
+        return {}, pd.Series(dtype=float), pd.Series(dtype=float)
 
     latest = df_all.groupby("symbol").tail(1).set_index("symbol")
     grouped = df_all.groupby("symbol")
@@ -125,16 +174,21 @@ def get_market_breadth(df_all):
     high_all = grouped["high"].max()
     low_all = grouped["low"].min()
 
-    at_high = (latest["close"] >= high_all).sum()
-    at_low = (latest["close"] <= low_all).sum()
+    pct_from_high = (high_all - latest["close"]) / high_all * 100
+    pct_from_low = (latest["close"] - low_all) / low_all * 100
+
+    near_high = (pct_from_high <= near_pct).sum()
+    near_low = (pct_from_low <= near_pct).sum()
     above_sma50 = (latest["close"] > latest_sma).sum()
     total_with_sma = latest_sma.notna().sum()
 
-    return {
-        "new_highs": int(at_high),
-        "new_lows": int(at_low),
+    breadth = {
+        "near_high_count": int(near_high),
+        "near_low_count": int(near_low),
+        "near_pct": near_pct,
         "pct_above_sma50": round(float(above_sma50) / float(total_with_sma) * 100, 1) if total_with_sma else None,
     }
+    return breadth, high_all, low_all
 
 
 def get_sector_rotation(df_all, top_n=8, min_stocks=3):
@@ -244,6 +298,10 @@ def get_stock_detail(symbol):
 
     ema20 = close.ewm(span=20).mean().iloc[-1]
     ema50 = close.ewm(span=50).mean().iloc[-1]
+    # min_periods so this still returns a (less warmed-up) value with under
+    # 200 rows of history, rather than NaN - most symbols have ~250 rows but
+    # newer listings may not.
+    ema200 = close.ewm(span=200, min_periods=20).mean().iloc[-1]
     rsi = calc_rsi(close).iloc[-1]
     sma20 = close.rolling(20).mean().iloc[-1]
     std20 = close.rolling(20).std().iloc[-1]
@@ -307,6 +365,7 @@ def get_stock_detail(symbol):
         "avg_volume": round(float(avg_vol) / 1e6, 2),
         "ema20": round(float(ema20), 2),
         "ema50": round(float(ema50), 2),
+        "ema200": round(float(ema200), 2) if pd.notna(ema200) else None,
         "rsi": round(float(rsi), 1),
         "rsi_signal": rsi_signal,
         "macd": round(float(macd), 3),
@@ -374,6 +433,15 @@ _start_scheduler()
 @app.route("/api/stock/<symbol>")
 def api_stock(symbol):
     return jsonify(get_stock_detail(symbol))
+
+
+@app.route("/api/consensus/<symbol>")
+def api_consensus(symbol):
+    detail = get_stock_detail(symbol)
+    consensus = get_ai_consensus(detail)
+    if consensus is None:
+        return jsonify({"error": "No data"})
+    return jsonify(consensus)
 
 
 @app.route("/api/chart/<symbol>")
@@ -599,7 +667,7 @@ def index():
     movers_chart = json.dumps(mov_fig, cls=PlotlyJSONEncoder)
 
     df_all = get_all_daily_history()
-    breadth = get_market_breadth(df_all)
+    breadth, high_all, low_all = get_market_breadth(df_all)
     rotation = get_sector_rotation(df_all)
 
     rot_fig = px.bar(_no_bdata(rotation.sort_values("chg_20d"), "chg_20d"), y="sector", x="chg_20d", orientation="h",
@@ -611,6 +679,13 @@ def index():
                           font=dict(color="#9ca3af", size=11, family="monospace"),
                           xaxis=dict(gridcolor="#1f2937"), yaxis=dict(gridcolor="#1f2937"))
     rotation_chart = json.dumps(rot_fig, cls=PlotlyJSONEncoder)
+
+    # Merge in 52W high/low + distance so the dashboard's clickable "near 52W
+    # high/low" KPI drill-downs can filter client-side without another request.
+    df["high_52w"] = df["symbol"].map(high_all)
+    df["low_52w"] = df["symbol"].map(low_all)
+    df["pct_from_high"] = ((df["high_52w"] - df["close"]) / df["high_52w"] * 100).round(2)
+    df["pct_from_low"] = ((df["close"] - df["low_52w"]) / df["low_52w"] * 100).round(2)
 
     stocks = df.to_dict("records")
     gainers = len(df[df["day_chg"] > 0])
@@ -722,6 +797,19 @@ tbody tr:hover .sym-col{background:var(--hover);}
 .up{color:var(--green);font-weight:700;}
 .dn{color:var(--red);font-weight:700;}
 .dim{color:var(--dim);}
+.kpi.clickable{cursor:pointer;transition:background .15s;}
+.kpi.clickable:hover{background:var(--hover);}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center;}
+.modal-overlay.active{display:flex;}
+.modal-box{background:var(--card);border:1px solid var(--border);border-radius:8px;width:min(520px,90vw);max-height:80vh;display:flex;flex-direction:column;overflow:hidden;}
+.modal-header{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;}
+.modal-title{font-size:13px;font-weight:700;color:var(--bright);}
+.modal-close{cursor:pointer;color:var(--dim);font-size:18px;line-height:1;}
+.modal-close:hover{color:var(--bright);}
+.modal-list{overflow-y:auto;padding:6px 0;}
+.modal-row{display:flex;align-items:center;justify-content:space-between;padding:10px 18px;cursor:pointer;border-bottom:1px solid rgba(30,30,42,.6);}
+.modal-row:hover{background:var(--hover);}
+.modal-row-name{color:var(--dim);font-size:11px;margin-top:2px;}
 @media(max-width:1000px){
   .body{grid-template-columns:1fr}
   .sidebar{flex-direction:row;flex-wrap:wrap;border-right:none;border-bottom:1px solid var(--border);}
@@ -751,11 +839,11 @@ tbody tr:hover .sym-col{background:var(--hover);}
         <div class="kpi-label">Avg Change</div>
         <div class="kpi-val {% if avg_chg >= 0 %}g{% else %}r{% endif %}">{% if avg_chg >= 0 %}+{% endif %}{{ avg_chg }}%</div>
       </div>
-      <div class="kpi g"><div class="kpi-label">Gainers</div><div class="kpi-val g">{{ gainers }}</div></div>
-      <div class="kpi r"><div class="kpi-label">Losers</div><div class="kpi-val r">{{ losers }}</div></div>
-      <div class="kpi a"><div class="kpi-label">Top Gainer</div><div class="kpi-val a" style="font-size:13px">{{ top_gainer }}</div></div>
-      <div class="kpi g"><div class="kpi-label">New 52W Highs</div><div class="kpi-val g">{{ breadth.new_highs }}</div></div>
-      <div class="kpi r"><div class="kpi-label">New 52W Lows</div><div class="kpi-val r">{{ breadth.new_lows }}</div></div>
+      <div class="kpi g clickable" onclick="showGainers()"><div class="kpi-label">Gainers</div><div class="kpi-val g">{{ gainers }}</div></div>
+      <div class="kpi r clickable" onclick="showLosers()"><div class="kpi-label">Losers</div><div class="kpi-val r">{{ losers }}</div></div>
+      <div class="kpi a clickable" onclick="showGainers()"><div class="kpi-label">Top Gainer</div><div class="kpi-val a" style="font-size:13px">{{ top_gainer }}</div></div>
+      <div class="kpi g clickable" onclick="showNearHigh()"><div class="kpi-label">Near 52W High (±{{ breadth.near_pct }}%)</div><div class="kpi-val g">{{ breadth.near_high_count }}</div></div>
+      <div class="kpi r clickable" onclick="showNearLow()"><div class="kpi-label">Near 52W Low (±{{ breadth.near_pct }}%)</div><div class="kpi-val r">{{ breadth.near_low_count }}</div></div>
       {% if breadth.pct_above_sma50 is not none %}
       <div class="kpi {% if breadth.pct_above_sma50 >= 50 %}g{% else %}r{% endif %}">
         <div class="kpi-label">Above 50D Avg</div>
@@ -811,7 +899,17 @@ tbody tr:hover .sym-col{background:var(--hover);}
     </div>
   </div>
 </div>
+<div class="modal-overlay" id="modalOverlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <span class="modal-title" id="modalTitle">-</span>
+      <span class="modal-close" onclick="closeModal()">&times;</span>
+    </div>
+    <div class="modal-list" id="modalList"></div>
+  </div>
+</div>
 <script>
+var allStocks={{ stocks|tojson }};
 var secChart={{ sector_chart|safe }};
 var movChart={{ movers_chart|safe }};
 var rotChart={{ rotation_chart|safe }};
@@ -827,6 +925,46 @@ setInterval(()=>{
     hour12:false,timeZone:'Asia/Kolkata'
   })+' IST';
 },1000);
+
+// KPI drill-down modal
+function openModal(title, rows, valueFn){
+  document.getElementById('modalTitle').textContent=`${title} (${rows.length})`;
+  const list=document.getElementById('modalList');
+  if(rows.length===0){
+    list.innerHTML='<div style="padding:20px;text-align:center;color:var(--dim)">No stocks match</div>';
+  } else {
+    list.innerHTML=rows.map(s=>`
+      <div class="modal-row" onclick="location.href='/stock/${s.symbol}'">
+        <div>
+          <div class="sym">${s.symbol.replace('.NS','')}</div>
+          <div class="modal-row-name">${s.name}</div>
+        </div>
+        <div>${valueFn(s)}</div>
+      </div>
+    `).join('');
+  }
+  document.getElementById('modalOverlay').classList.add('active');
+}
+function closeModal(){
+  document.getElementById('modalOverlay').classList.remove('active');
+}
+function showGainers(){
+  const rows=allStocks.filter(s=>s.day_chg>0).sort((a,b)=>b.day_chg-a.day_chg);
+  openModal('Gainers', rows, s=>`<span class="up">+${s.day_chg.toFixed(2)}%</span>`);
+}
+function showLosers(){
+  const rows=allStocks.filter(s=>s.day_chg<0).sort((a,b)=>a.day_chg-b.day_chg);
+  openModal('Losers', rows, s=>`<span class="dn">${s.day_chg.toFixed(2)}%</span>`);
+}
+function showNearHigh(){
+  const rows=allStocks.filter(s=>s.pct_from_high!=null&&s.pct_from_high<=5).sort((a,b)=>a.pct_from_high-b.pct_from_high);
+  openModal('Near 52W High', rows, s=>`<span class="up">${s.pct_from_high.toFixed(2)}% away</span>`);
+}
+function showNearLow(){
+  const rows=allStocks.filter(s=>s.pct_from_low!=null&&s.pct_from_low<=5).sort((a,b)=>a.pct_from_low-b.pct_from_low);
+  openModal('Near 52W Low', rows, s=>`<span class="dn">${s.pct_from_low.toFixed(2)}% away</span>`);
+}
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeModal(); });
 
 // Search
 function filterTable(){
@@ -910,6 +1048,7 @@ body{min-height:100vh;}
     <div class="tab" onclick="switchTab('fundamental')">Fundamental</div>
     <div class="tab" onclick="switchTab('corporate')">Corporate</div>
     <div class="tab" onclick="switchTab('company')">Company</div>
+    <div class="tab" onclick="switchTab('ai')">AI Signal</div>
   </div>
 
   <!-- TECHNICAL TAB -->
@@ -1038,6 +1177,25 @@ body{min-height:100vh;}
       </div>
       <div class="section-title">About</div>
       <div id="co-desc" style="font-size:12px;color:var(--text);line-height:1.7;background:var(--bg);padding:12px;border-radius:3px;border:1px solid var(--border)">-</div>
+    </div>
+  </div>
+
+  <!-- AI SIGNAL TAB -->
+  <div class="tab-content" id="tab-ai">
+    <div id="ai-loading" style="color:var(--dim);padding:20px;text-align:center">
+      <span class="spinner"></span> Running agent consensus...
+    </div>
+    <div id="ai-content" style="display:none">
+      <div id="ai-mode-banner" style="font-size:11px;color:var(--amber);background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.3);padding:8px 12px;border-radius:4px;margin-bottom:12px;"></div>
+      <div class="section-title">Consensus</div>
+      <div class="corp-signal" id="ai-consensus-signal">-</div>
+      <div class="grid3">
+        <div class="stat-box"><div class="stat-label">Conviction</div><div class="stat-val" id="ai-conviction">-</div></div>
+        <div class="stat-box"><div class="stat-label">Avg Confidence</div><div class="stat-val" id="ai-confidence">-</div></div>
+        <div class="stat-box"><div class="stat-label">Votes (Buy/Sell/Hold)</div><div class="stat-val" id="ai-votes">-</div></div>
+      </div>
+      <div class="section-title">Agent Breakdown</div>
+      <div class="grid3" id="ai-agent-cards"></div>
     </div>
   </div>
 </div>
@@ -1240,9 +1398,59 @@ async function loadCorporate(){
   }
 }
 
+async function loadAIConsensus(){
+  try{
+    const r=await fetch(`/api/consensus/${sym}`);
+    const d=await r.json();
+    if(d.error){
+      document.getElementById('ai-loading').textContent='⚠️ '+d.error;
+      return;
+    }
+
+    const live=d.agents_live||{};
+    const anyLive=Object.values(live).some(v=>v);
+    document.getElementById('ai-mode-banner').textContent = anyLive
+      ? 'Live API keys detected for: '+Object.keys(live).filter(k=>live[k]).join(', ')+'. Others still run offline rule-based analysis.'
+      : 'Offline mode: all three agents are running rule-based technical analysis (no LLM API calls) — no ANTHROPIC_API_KEY/GEMINI_API_KEY/DEEPSEEK_API_KEY configured yet.';
+
+    const sig=d.consensus_signal||'HOLD';
+    let sigColor='#9ca3af';
+    if(sig==='BUY') sigColor='#34d399';
+    else if(sig==='SELL') sigColor='#f87171';
+    const sigEl=document.getElementById('ai-consensus-signal');
+    sigEl.textContent=`${sig}  ·  ${d.conviction||'LOW'} conviction`;
+    sigEl.style.background=sigColor+'18';
+    sigEl.style.border=`1px solid ${sigColor}44`;
+    sigEl.style.color=sigColor;
+
+    document.getElementById('ai-conviction').textContent=d.conviction||'-';
+    document.getElementById('ai-confidence').textContent=`${d.confidence||0}%`;
+    const v=d.votes||{};
+    document.getElementById('ai-votes').textContent=`${v.buy||0} / ${v.sell||0} / ${v.hold||0}`;
+
+    const cardsEl=document.getElementById('ai-agent-cards');
+    cardsEl.innerHTML=(d.agent_details||[]).map(a=>{
+      let c='#9ca3af';
+      if(a.signal==='BUY') c='#34d399'; else if(a.signal==='SELL') c='#f87171';
+      const isLive=live[a.agent];
+      return `<div class="stat-box">
+        <div class="stat-label">${a.agent} ${isLive?'· live':'· offline'}</div>
+        <div class="stat-val" style="color:${c}">${a.signal} (${a.confidence}%)</div>
+        <div style="font-size:11px;color:var(--text);margin-top:6px;line-height:1.5">${a.reasoning||'No reasoning available'}</div>
+      </div>`;
+    }).join('');
+
+    document.getElementById('ai-loading').style.display='none';
+    document.getElementById('ai-content').style.display='block';
+  }catch(e){
+    document.getElementById('ai-loading').textContent='Failed to load: '+e.message;
+  }
+}
+
 loadChart();
 loadTechnical();
 loadCorporate();
+loadAIConsensus();
 </script>
 </body>
 </html>"""

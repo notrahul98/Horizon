@@ -1,5 +1,5 @@
 """
-swing_trader/agents/deepseek_agent.py
+stock-collector/agents/deepseek_agent.py
 DeepSeek agent for quantitative analysis
 """
 

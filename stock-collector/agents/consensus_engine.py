@@ -1,5 +1,5 @@
 """
-swing_trader/agents/consensus_engine.py
+stock-collector/agents/consensus_engine.py
 Aggregate recommendations from multiple agents
 """
 
