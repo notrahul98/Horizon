@@ -75,6 +75,103 @@ def get_latest_df():
     return df
 
 
+def get_all_daily_history():
+    """Full daily OHLC history for every symbol, for breadth/rotation stats
+    that need more than just the latest bar. One bulk query instead of N
+    per-symbol ones — 139 symbols x ~250 days is small enough for pandas to
+    just chew through in one pass."""
+    q = """
+        SELECT p.symbol, s.sector, p.date, p.close, p.high, p.low
+        FROM price_history p
+        JOIN stocks s ON s.symbol = p.symbol
+        WHERE p.interval = 'day'
+        ORDER BY p.symbol, p.date
+    """
+    with get_conn() as c:
+        df = pd.read_sql_query(q, c, parse_dates=["date"])
+    return df
+
+
+def get_market_breadth(df_all):
+    """Advance/decline plus two breadth reads that need historical context
+    beyond a single day's snapshot: how many stocks are at a genuine new
+    52-week high/low (not just up/down today), and how many are trading
+    above their own 50-day average (a broad rally vs a narrow one)."""
+    if df_all.empty:
+        return {}
+
+    latest = df_all.groupby("symbol").tail(1).set_index("symbol")
+    grouped = df_all.groupby("symbol")
+
+    sma50 = grouped["close"].transform(lambda s: s.rolling(50, min_periods=10).mean())
+    df_all = df_all.assign(sma50=sma50)
+    latest_sma = df_all.groupby("symbol").tail(1).set_index("symbol")["sma50"]
+
+    high_all = grouped["high"].max()
+    low_all = grouped["low"].min()
+
+    at_high = (latest["close"] >= high_all).sum()
+    at_low = (latest["close"] <= low_all).sum()
+    above_sma50 = (latest["close"] > latest_sma).sum()
+    total_with_sma = latest_sma.notna().sum()
+
+    return {
+        "new_highs": int(at_high),
+        "new_lows": int(at_low),
+        "pct_above_sma50": round(float(above_sma50) / float(total_with_sma) * 100, 1) if total_with_sma else None,
+    }
+
+
+def get_sector_rotation(df_all, top_n=8, min_stocks=3):
+    """Which sectors have gained/lost relative strength recently: compute
+    each stock's own % return over the last 5 and 20 trading days (against
+    its own date series), then average those returns within each sector.
+    Positive + accelerating = money rotating in; negative = rotating out.
+
+    Deliberately averaging per-stock *returns*, not raw price levels across
+    stocks: stocks don't always share an identical trading-day calendar
+    (e.g. one extra/missing row from a data hiccup), and averaging price
+    levels breaks badly on the day where only some stocks have reported —
+    the sector "index" swings by whatever the mix of who's-in shifts to,
+    which can look like a huge move that isn't real.
+
+    `sector` here is actually yfinance's granular "industry" field (see
+    config.py's get_watchlist), so most values have exactly one constituent
+    stock — e.g. "Oil & Gas Refining & Marketing" is just RELIANCE. A lone
+    stock's move isn't "sector rotation," it's noise wearing a sector's
+    name, so anything under min_stocks constituents is dropped rather than
+    reported as if it were a real sector signal.
+    """
+    if df_all.empty:
+        return pd.DataFrame(columns=["sector", "chg_5d", "chg_20d"])
+
+    def pct_change_n(series, n):
+        if len(series) <= n:
+            return None
+        prior = series.iloc[-1 - n]
+        return (series.iloc[-1] - prior) / prior * 100 if prior else None
+
+    rows = []
+    for symbol, group in df_all.sort_values("date").groupby("symbol"):
+        closes = group["close"]
+        rows.append({
+            "symbol": symbol,
+            "sector": group["sector"].iloc[-1],
+            "chg_5d": pct_change_n(closes, 5),
+            "chg_20d": pct_change_n(closes, 20),
+        })
+    per_stock = pd.DataFrame(rows).dropna(subset=["chg_20d"])
+
+    counts = per_stock.groupby("sector")["symbol"].nunique()
+    valid_sectors = counts[counts >= min_stocks].index
+    per_stock = per_stock[per_stock["sector"].isin(valid_sectors)]
+    if per_stock.empty:
+        return pd.DataFrame(columns=["sector", "chg_5d", "chg_20d"])
+
+    out = per_stock.groupby("sector")[["chg_5d", "chg_20d"]].mean().round(2).reset_index()
+    return out.sort_values("chg_20d", ascending=False).head(top_n)
+
+
 def get_history(symbol, days=90):
     q = """SELECT date, open, high, low, close, volume
            FROM price_history
@@ -94,12 +191,39 @@ def calc_rsi(series, period=14):
     return (100 - 100 / (1 + rs)).round(2)
 
 
+def calc_stochastic(high, low, close, period=14, smooth=3):
+    lowest_low = low.rolling(period).min()
+    highest_high = high.rolling(period).max()
+    rng = (highest_high - lowest_low).replace(0, 1e-9)
+    k = (close - lowest_low) / rng * 100
+    d = k.rolling(smooth).mean()
+    return k, d
+
+
+def calc_williams_r(high, low, close, period=14):
+    highest_high = high.rolling(period).max()
+    lowest_low = low.rolling(period).min()
+    rng = (highest_high - lowest_low).replace(0, 1e-9)
+    return (highest_high - close) / rng * -100
+
+
+def calc_cci(high, low, close, period=20):
+    typical = (high + low + close) / 3
+    sma = typical.rolling(period).mean()
+    mean_dev = typical.rolling(period).apply(lambda x: (x - x.mean()).abs().mean(), raw=False)
+    return (typical - sma) / (0.015 * mean_dev.replace(0, 1e-9))
+
+
 def get_stock_detail(symbol):
-    hist = get_history(symbol, 90)
+    # 260 trading days (~1 calendar year) so 52W high/low are accurate and the
+    # longer indicators (SMA50, CCI) have enough warm-up data — the 90-day
+    # window used elsewhere is fine for the *chart display* but was silently
+    # truncating "52W High/Low" to just the last 90 days here.
+    hist = get_history(symbol, 260)
     if hist.empty:
         return {}
 
-    close = hist["close"]
+    close, high, low = hist["close"], hist["high"], hist["low"]
     latest = hist.iloc[-1]
     prev = hist.iloc[-2] if len(hist) > 1 else hist.iloc[-1]
 
@@ -110,8 +234,8 @@ def get_stock_detail(symbol):
     std20 = close.rolling(20).std().iloc[-1]
     bb_upper = sma20 + 2 * std20
     bb_lower = sma20 - 2 * std20
-    high_52w = hist["high"].max()
-    low_52w = hist["low"].min()
+    high_52w = high.max()
+    low_52w = low.min()
     avg_vol = hist["volume"].mean()
     ema12 = close.ewm(span=12).mean()
     ema26 = close.ewm(span=26).mean()
@@ -121,12 +245,38 @@ def get_stock_detail(symbol):
     trend = "BULLISH" if ema20 > ema50 else "BEARISH"
     trend_color = "#34d399" if trend == "BULLISH" else "#f87171"
 
+    stoch_k, stoch_d = calc_stochastic(high, low, close)
+    williams_r = calc_williams_r(high, low, close).iloc[-1]
+    cci = calc_cci(high, low, close).iloc[-1]
+    stoch_k_val, stoch_d_val = stoch_k.iloc[-1], stoch_d.iloc[-1]
+
     if rsi < 30:
         rsi_signal = "OVERSOLD"
     elif rsi > 70:
         rsi_signal = "OVERBOUGHT"
     else:
         rsi_signal = "NEUTRAL"
+
+    if stoch_k_val < 20:
+        stoch_signal = "OVERSOLD"
+    elif stoch_k_val > 80:
+        stoch_signal = "OVERBOUGHT"
+    else:
+        stoch_signal = "NEUTRAL"
+
+    if williams_r < -80:
+        williams_signal = "OVERSOLD"
+    elif williams_r > -20:
+        williams_signal = "OVERBOUGHT"
+    else:
+        williams_signal = "NEUTRAL"
+
+    if cci > 100:
+        cci_signal = "OVERBOUGHT"
+    elif cci < -100:
+        cci_signal = "OVERSOLD"
+    else:
+        cci_signal = "NEUTRAL"
 
     return {
         "symbol": symbol,
@@ -152,6 +302,13 @@ def get_stock_detail(symbol):
         "trend": trend,
         "trend_color": trend_color,
         "sma20": round(float(sma20), 2),
+        "stoch_k": round(float(stoch_k_val), 1) if pd.notna(stoch_k_val) else None,
+        "stoch_d": round(float(stoch_d_val), 1) if pd.notna(stoch_d_val) else None,
+        "stoch_signal": stoch_signal,
+        "williams_r": round(float(williams_r), 1) if pd.notna(williams_r) else None,
+        "williams_signal": williams_signal,
+        "cci": round(float(cci), 1) if pd.notna(cci) else None,
+        "cci_signal": cci_signal,
     }
 
 
@@ -420,6 +577,20 @@ def index():
                           xaxis=dict(gridcolor="#1f2937"), yaxis=dict(gridcolor="#1f2937"))
     movers_chart = json.dumps(mov_fig, cls=PlotlyJSONEncoder)
 
+    df_all = get_all_daily_history()
+    breadth = get_market_breadth(df_all)
+    rotation = get_sector_rotation(df_all)
+
+    rot_fig = px.bar(rotation.sort_values("chg_20d"), y="sector", x="chg_20d", orientation="h",
+                     color="chg_20d", color_continuous_scale=["#f87171", "#6b7280", "#34d399"],
+                     color_continuous_midpoint=0)
+    rot_fig.update_layout(xaxis_title="", yaxis_title="", showlegend=False,
+                          margin=dict(t=10, b=10, l=110, r=20), coloraxis_showscale=False,
+                          paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                          font=dict(color="#9ca3af", size=11, family="monospace"),
+                          xaxis=dict(gridcolor="#1f2937"), yaxis=dict(gridcolor="#1f2937"))
+    rotation_chart = json.dumps(rot_fig, cls=PlotlyJSONEncoder)
+
     stocks = df.to_dict("records")
     gainers = len(df[df["day_chg"] > 0])
     losers = len(df[df["day_chg"] < 0])
@@ -436,6 +607,8 @@ def index():
         latest_date=df["date"].max(),
         sector_chart=sector_chart,
         movers_chart=movers_chart,
+        rotation_chart=rotation_chart,
+        breadth=breadth,
     )
 
 
@@ -560,8 +733,17 @@ tbody tr:hover .sym-col{background:var(--hover);}
       <div class="kpi g"><div class="kpi-label">Gainers</div><div class="kpi-val g">{{ gainers }}</div></div>
       <div class="kpi r"><div class="kpi-label">Losers</div><div class="kpi-val r">{{ losers }}</div></div>
       <div class="kpi a"><div class="kpi-label">Top Gainer</div><div class="kpi-val a" style="font-size:13px">{{ top_gainer }}</div></div>
+      <div class="kpi g"><div class="kpi-label">New 52W Highs</div><div class="kpi-val g">{{ breadth.new_highs }}</div></div>
+      <div class="kpi r"><div class="kpi-label">New 52W Lows</div><div class="kpi-val r">{{ breadth.new_lows }}</div></div>
+      {% if breadth.pct_above_sma50 is not none %}
+      <div class="kpi {% if breadth.pct_above_sma50 >= 50 %}g{% else %}r{% endif %}">
+        <div class="kpi-label">Above 50D Avg</div>
+        <div class="kpi-val {% if breadth.pct_above_sma50 >= 50 %}g{% else %}r{% endif %}">{{ breadth.pct_above_sma50 }}%</div>
+      </div>
+      {% endif %}
     </div>
     <div class="sidebar-charts">
+      <div><div class="chart-label">Sector Rotation · 20D</div><div class="chart-box" id="rot-chart"></div></div>
       <div><div class="chart-label">Sector Distribution</div><div class="chart-box" id="sec-chart"></div></div>
       <div><div class="chart-label">Top Movers</div><div class="chart-box" id="mov-chart"></div></div>
     </div>
@@ -611,8 +793,10 @@ tbody tr:hover .sym-col{background:var(--hover);}
 <script>
 var secChart={{ sector_chart|safe }};
 var movChart={{ movers_chart|safe }};
+var rotChart={{ rotation_chart|safe }};
 Plotly.newPlot('sec-chart',secChart.data,secChart.layout,{displayModeBar:false,responsive:true});
 Plotly.newPlot('mov-chart',movChart.data,movChart.layout,{displayModeBar:false,responsive:true});
+Plotly.newPlot('rot-chart',rotChart.data,rotChart.layout,{displayModeBar:false,responsive:true});
 
 // Live clock — must format in Asia/Kolkata explicitly, otherwise the browser's
 // own local timezone gets applied on top and the displayed time drifts.
@@ -736,6 +920,18 @@ body{min-height:100vh;}
       <div class="stat-box"><div class="stat-label">EMA 50</div><div class="stat-val a" id="d-ema50">-</div></div>
       <div class="stat-box"><div class="stat-label">MACD</div><div class="stat-val" id="d-macd">-</div></div>
       <div class="stat-box"><div class="stat-label">Signal Line</div><div class="stat-val" id="d-macd-sig">-</div></div>
+      <div class="stat-box">
+        <div class="stat-label">Stochastic %K/%D</div>
+        <div class="stat-val" id="d-stoch">-</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Williams %R (14)</div>
+        <div class="stat-val" id="d-williams">-</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">CCI (20)</div>
+        <div class="stat-val" id="d-cci">-</div>
+      </div>
     </div>
     <div class="stat-box">
       <div class="stat-label">Bollinger Band Position</div>
@@ -889,6 +1085,24 @@ async function loadTechnical(){
     document.getElementById('d-bb-up').textContent=`₹${d.bb_upper}`;
     document.getElementById('d-vol').textContent=`${(d.volume/1e6).toFixed(1)}M`;
     document.getElementById('d-avgvol').textContent=`${d.avg_volume}M`;
+
+    const stochEl=document.getElementById('d-stoch');
+    if(d.stoch_k!=null){
+      stochEl.textContent=`${d.stoch_k} / ${d.stoch_d ?? '-'} — ${d.stoch_signal}`;
+      stochEl.style.color=d.stoch_signal==='OVERSOLD'?'#34d399':d.stoch_signal==='OVERBOUGHT'?'#f87171':'#9ca3af';
+    } else { stochEl.textContent='N/A'; }
+
+    const willEl=document.getElementById('d-williams');
+    if(d.williams_r!=null){
+      willEl.textContent=`${d.williams_r} — ${d.williams_signal}`;
+      willEl.style.color=d.williams_signal==='OVERSOLD'?'#34d399':d.williams_signal==='OVERBOUGHT'?'#f87171':'#9ca3af';
+    } else { willEl.textContent='N/A'; }
+
+    const cciEl=document.getElementById('d-cci');
+    if(d.cci!=null){
+      cciEl.textContent=`${d.cci} — ${d.cci_signal}`;
+      cciEl.style.color=d.cci_signal==='OVERSOLD'?'#34d399':d.cci_signal==='OVERBOUGHT'?'#f87171':'#9ca3af';
+    } else { cciEl.textContent='N/A'; }
   }catch(e){console.error(e);}
 }
 
