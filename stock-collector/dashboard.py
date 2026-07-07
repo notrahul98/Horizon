@@ -415,34 +415,54 @@ def _run_daily_refresh():
         logger.exception("[daily_refresh] failed")
 
 
-# ── Phase 5: daily Telegram report ───────────────────────────────
+# ── Phase 5: daily report (website now, other channels later) ──────────
 # Runs 10 minutes after the price refresh (16:10 IST) so it's screening
-# against that day's data, not yesterday's. Telegram only for now (see
-# notifications.py); email/SMS need paid/credentialed services that
-# weren't set up. If TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID aren't set, this
-# logs what it would have sent instead of failing the job.
+# against that day's data, not yesterday's. Telegram delivery is wired up
+# (notifications.py) but the user's country blocks Telegram, so for now
+# the report is displayed on /report instead — same generation logic,
+# just a different last mile. Swap/add a channel later without touching
+# _generate_report_data() at all.
+_last_report = None  # cached dict from the most recent generation; see /report
+
+
+def _generate_report_data():
+    df = get_latest_df()
+    if df.empty:
+        return None
+
+    df_all = get_all_daily_history()
+    breadth, _, _ = get_market_breadth(df_all)
+    symbols = df["symbol"].tolist()
+
+    candidates = scan_for_candidates(symbols, get_stock_detail, get_history, get_ai_consensus)
+    return {
+        "candidates": candidates,
+        "breadth": breadth,
+        "total_stocks": len(df),
+        "gainers": int((df["day_chg"] > 0).sum()),
+        "losers": int((df["day_chg"] < 0).sum()),
+        "latest_date": df["date"].max(),
+        "generated_at": ist_now(),
+    }
+
+
 def _run_daily_alert():
+    global _last_report
     try:
-        df = get_latest_df()
-        if df.empty:
+        data = _generate_report_data()
+        if data is None:
             logger.warning("[daily_alert] no data yet, skipping")
             return
+        _last_report = data
 
-        df_all = get_all_daily_history()
-        breadth, _, _ = get_market_breadth(df_all)
-        symbols = df["symbol"].tolist()
-
-        candidates = scan_for_candidates(symbols, get_stock_detail, get_history, get_ai_consensus)
-        report = format_daily_report(
-            candidates=candidates,
-            breadth=breadth,
-            total_stocks=len(df),
-            gainers=int((df["day_chg"] > 0).sum()),
-            losers=int((df["day_chg"] < 0).sum()),
-            latest_date=df["date"].max(),
+        report_text = format_daily_report(
+            candidates=data["candidates"], breadth=data["breadth"],
+            total_stocks=data["total_stocks"], gainers=data["gainers"],
+            losers=data["losers"], latest_date=data["latest_date"],
         )
-        logger.info("[daily_alert] %d candidates found, sending report ...", len(candidates))
-        send_telegram(report)
+        logger.info("[daily_alert] %d candidates found", len(data["candidates"]))
+        if telegram_enabled():
+            send_telegram(report_text)
     except Exception:
         logger.exception("[daily_alert] failed")
 
@@ -487,28 +507,47 @@ def api_consensus(symbol):
 
 @app.route("/api/send-report", methods=["POST"])
 def api_send_report():
-    """Manual trigger for testing the Phase 5 daily report without waiting
-    for the 16:10 IST schedule. POST-only since it has a side effect
-    (sends a Telegram message if configured)."""
-    df = get_latest_df()
-    if df.empty:
+    """Manually regenerate the Phase 5 report (updates /report + retries
+    Telegram if configured) without waiting for the 16:10 IST schedule.
+    POST-only since it has a side effect."""
+    global _last_report
+    data = _generate_report_data()
+    if data is None:
         return jsonify({"error": "No data yet"}), 503
+    _last_report = data
 
-    df_all = get_all_daily_history()
-    breadth, _, _ = get_market_breadth(df_all)
-    candidates = scan_for_candidates(df["symbol"].tolist(), get_stock_detail, get_history, get_ai_consensus)
-    report = format_daily_report(
-        candidates=candidates, breadth=breadth, total_stocks=len(df),
-        gainers=int((df["day_chg"] > 0).sum()), losers=int((df["day_chg"] < 0).sum()),
-        latest_date=df["date"].max(),
+    report_text = format_daily_report(
+        candidates=data["candidates"], breadth=data["breadth"],
+        total_stocks=data["total_stocks"], gainers=data["gainers"],
+        losers=data["losers"], latest_date=data["latest_date"],
     )
-    sent = send_telegram(report)
+    sent = send_telegram(report_text) if telegram_enabled() else False
     return jsonify({
         "telegram_configured": telegram_enabled(),
         "sent": sent,
-        "candidates_found": len(candidates),
-        "report_preview": report,
+        "candidates_found": len(data["candidates"]),
+        "report_preview": report_text,
     })
+
+
+@app.route("/report")
+def report_page():
+    global _last_report
+    if _last_report is None:
+        _last_report = _generate_report_data()
+    if _last_report is None:
+        return "<h1 style='color:#9ca3af;font-family:monospace;padding:40px'>No data yet.</h1>"
+
+    with get_conn() as c:
+        names = {r["symbol"]: r["name"] for r in c.execute("SELECT symbol, name FROM stocks").fetchall()}
+    for cand in _last_report["candidates"]:
+        cand["name"] = names.get(cand["symbol"], "")
+
+    return render_template_string(REPORT_HTML,
+        ist_time=ist_now(),
+        report=_last_report,
+        telegram_configured=telegram_enabled(),
+    )
 
 
 @app.route("/api/chart/<symbol>")
@@ -894,7 +933,10 @@ tbody tr:hover .sym-col{background:var(--hover);}
     <div class="dot"></div>
     <span class="brand-name">NIFTY 150 TERMINAL</span>
   </div>
-  <div class="nav-meta" id="navTime">{{ ist_time }}</div>
+  <div class="nav-links">
+    <a href="/report" class="nav-back">Daily Report →</a>
+    <div class="nav-meta" id="navTime">{{ ist_time }}</div>
+  </div>
 </nav>
 <div class="body">
   <!-- SIDEBAR -->
@@ -1518,6 +1560,125 @@ loadChart();
 loadTechnical();
 loadCorporate();
 loadAIConsensus();
+</script>
+</body>
+</html>"""
+
+REPORT_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Daily Report — Nifty 150 Terminal</title>
+<style>
+""" + BASE_STYLE + r"""
+body{min-height:100vh;}
+.page{max-width:1000px;margin:0 auto;padding:20px 24px 60px;}
+.report-header{padding:16px 0;border-bottom:1px solid var(--border);margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;}
+.report-title{font-size:20px;font-weight:700;color:var(--bright);}
+.report-meta{color:var(--dim);font-size:11px;margin-top:4px;}
+.refresh-btn{background:var(--card);border:1px solid var(--border);color:var(--bright);padding:8px 16px;border-radius:4px;font-family:inherit;font-size:12px;cursor:pointer;}
+.refresh-btn:hover{border-color:var(--blue);color:var(--blue);}
+.kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:20px;}
+.kpi-row .kpi{border-left:3px solid var(--border);border-radius:0 8px 8px 0;padding:12px 14px;background:var(--card);}
+.cand-table{width:100%;border-collapse:collapse;font-size:12px;}
+.cand-table th{text-align:left;padding:9px 10px;font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap;}
+.cand-table th.r,.cand-table td.r{text-align:right;}
+.cand-table td{padding:10px;border-bottom:1px solid rgba(30,30,42,.6);white-space:nowrap;}
+.cand-table tr{cursor:pointer;}
+.cand-table tr:hover td{background:var(--hover);}
+.telegram-note{font-size:11px;color:var(--dim);background:var(--card);border:1px solid var(--border);padding:10px 14px;border-radius:4px;margin-top:20px;}
+.disclaimer{font-size:11px;color:var(--dim);margin-top:14px;line-height:1.6;}
+</style>
+</head>
+<body>
+<nav class="nav">
+  <div class="nav-brand">
+    <a href="/" class="brand-name"><div class="dot" style="display:inline-block;vertical-align:middle;margin-right:8px"></div>NIFTY 150 TERMINAL</a>
+  </div>
+  <div class="nav-links">
+    <a href="/" class="nav-back">← Dashboard</a>
+    <div class="nav-meta" id="navTime">{{ ist_time }}</div>
+  </div>
+</nav>
+<div class="page">
+  <div class="report-header">
+    <div>
+      <div class="report-title">Daily Report</div>
+      <div class="report-meta">{{ report.latest_date }} · generated {{ report.generated_at }}</div>
+    </div>
+    <button class="refresh-btn" onclick="regenerate()" id="refreshBtn">Regenerate</button>
+  </div>
+
+  <div class="kpi-row">
+    <div class="kpi"><div class="kpi-label">Tracked</div><div class="kpi-val">{{ report.total_stocks }}</div></div>
+    <div class="kpi"><div class="kpi-label">Gainers</div><div class="kpi-val g">{{ report.gainers }}</div></div>
+    <div class="kpi"><div class="kpi-label">Losers</div><div class="kpi-val r">{{ report.losers }}</div></div>
+    <div class="kpi"><div class="kpi-label">Near 52W High</div><div class="kpi-val g">{{ report.breadth.near_high_count }}</div></div>
+    <div class="kpi"><div class="kpi-label">Near 52W Low</div><div class="kpi-val r">{{ report.breadth.near_low_count }}</div></div>
+    {% if report.breadth.pct_above_sma50 is not none %}
+    <div class="kpi"><div class="kpi-label">Above 50D Avg</div><div class="kpi-val">{{ report.breadth.pct_above_sma50 }}%</div></div>
+    {% endif %}
+  </div>
+
+  <div class="section-title">Swing Candidates — 5-15 day momentum ({{ report.candidates|length }} found)</div>
+  {% if report.candidates|length == 0 %}
+    <p style="color:var(--dim);padding:20px 0;">No candidates cleared the screen today.</p>
+  {% else %}
+  <table class="cand-table">
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th class="r">Entry ₹</th>
+        <th class="r">Stop Loss ₹</th>
+        <th class="r">Target ₹</th>
+        <th class="r">Risk%</th>
+        <th class="r">Reward%</th>
+        <th class="r">Confidence</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in report.candidates %}
+      <tr onclick="location.href='/stock/{{ c.symbol }}'">
+        <td><span class="sym">{{ c.symbol.replace('.NS','') }}</span><div class="modal-row-name">{{ c.name }}</div></td>
+        <td class="r">{{ "%.2f"|format(c.entry) }}</td>
+        <td class="r dn">{{ "%.2f"|format(c.stop_loss) }} (-{{ c.risk_pct }}%)</td>
+        <td class="r up">{{ "%.2f"|format(c.target) }} (+{{ c.reward_pct }}%)</td>
+        <td class="r dn">-{{ c.risk_pct }}%</td>
+        <td class="r up">+{{ c.reward_pct }}%</td>
+        <td class="r">{{ c.confidence }}% ({{ c.conviction }})</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if not telegram_configured %}
+  <div class="telegram-note">Telegram delivery isn't configured (blocked in your country) — this page is the report for now. See replit.md for wiring up an alternative channel later.</div>
+  {% endif %}
+
+  <div class="disclaimer">Rule-based technical screen only — not financial advice. Verify independently before trading; past setups don't guarantee outcomes.</div>
+</div>
+<script>
+setInterval(()=>{
+  document.getElementById('navTime').textContent=new Date().toLocaleString('en-IN',{
+    day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',
+    hour12:false,timeZone:'Asia/Kolkata'
+  })+' IST';
+},1000);
+
+async function regenerate(){
+  const btn=document.getElementById('refreshBtn');
+  btn.textContent='Regenerating...';
+  btn.disabled=true;
+  try{
+    await fetch('/api/send-report', {method:'POST'});
+    location.reload();
+  }catch(e){
+    btn.textContent='Failed — retry';
+    btn.disabled=false;
+  }
+}
 </script>
 </body>
 </html>"""
