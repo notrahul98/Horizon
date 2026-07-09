@@ -14,6 +14,7 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+from plotly.subplots import make_subplots
 from plotly.utils import PlotlyJSONEncoder
 from flask import Flask, render_template_string, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -311,7 +312,10 @@ def get_stock_detail(symbol):
     bb_lower = sma20 - 2 * std20
     high_52w = high.max()
     low_52w = low.min()
-    avg_vol = hist["volume"].mean()
+    # 50 trading days, not the full 260-row window — the old .mean() over
+    # everything was displayed as "90D Avg Vol", which was wrong twice over.
+    avg_vol_50d = hist["volume"].tail(50).mean()
+    vol_ratio = (float(latest["volume"]) / avg_vol_50d) if avg_vol_50d else None
     ema12 = close.ewm(span=12).mean()
     ema26 = close.ewm(span=26).mean()
     macd = (ema12 - ema26).iloc[-1]
@@ -364,7 +368,8 @@ def get_stock_detail(symbol):
         "day_chg": round((latest["close"] - prev["close"]) / prev["close"] * 100, 2),
         "high_52w": round(float(high_52w), 2),
         "low_52w": round(float(low_52w), 2),
-        "avg_volume": round(float(avg_vol) / 1e6, 2),
+        "avg_volume_50d": round(float(avg_vol_50d) / 1e6, 2) if pd.notna(avg_vol_50d) else None,
+        "vol_ratio": round(vol_ratio, 2) if vol_ratio is not None else None,
         "ema20": round(float(ema20), 2),
         "ema50": round(float(ema50), 2),
         "ema200": round(float(ema200), 2) if pd.notna(ema200) else None,
@@ -567,20 +572,39 @@ def api_chart(symbol):
     # renders garbage instead of the real chart. Passing plain Python lists
     # (and date strings, not Timestamps) avoids that code path entirely.
     dates = hist["date"].dt.strftime("%Y-%m-%d").tolist()
-    fig = go.Figure()
+    opens = hist["open"].tolist()
+    closes = hist["close"].tolist()
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.72, 0.28], vertical_spacing=0.04)
     fig.add_trace(go.Candlestick(
-        x=dates, open=hist["open"].tolist(), high=hist["high"].tolist(),
-        low=hist["low"].tolist(), close=hist["close"].tolist(), name="OHLC",
+        x=dates, open=opens, high=hist["high"].tolist(),
+        low=hist["low"].tolist(), close=closes, name="OHLC",
         increasing_line_color="#34d399", decreasing_line_color="#f87171",
         increasing_fillcolor="#34d399", decreasing_fillcolor="#f87171",
-    ))
+    ), row=1, col=1)
     fig.add_trace(go.Scatter(x=dates, y=ema20.tolist(), name="EMA20",
-        line=dict(color="#38bdf8", width=1.2), opacity=0.8))
+        line=dict(color="#38bdf8", width=1.2), opacity=0.8), row=1, col=1)
     fig.add_trace(go.Scatter(x=dates, y=ema50.tolist(), name="EMA50",
-        line=dict(color="#fbbf24", width=1.2), opacity=0.8))
-    fig.update_layout(height=280, xaxis_rangeslider_visible=False,
+        line=dict(color="#fbbf24", width=1.2), opacity=0.8), row=1, col=1)
+
+    vol_colors = ["#34d399" if c >= o else "#f87171" for c, o in zip(closes, opens)]
+    fig.add_trace(go.Bar(
+        x=dates, y=hist["volume"].tolist(), name="Volume",
+        marker_color=vol_colors, opacity=0.55,
+    ), row=2, col=1)
+
+    fig.update_layout(height=380, showlegend=True,
         title=dict(text=f"{symbol} — 90 Day Chart", font=dict(color="#d1d5db", size=12)),
-        **PLOTLY_DARK)
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#9ca3af", size=11, family="monospace"),
+        margin=dict(t=30, b=30, l=50, r=20))
+    # Subplots create xaxis2/yaxis2, so per-axis styling from PLOTLY_DARK
+    # (which only targets xaxis/yaxis) has to be applied across all axes here.
+    fig.update_xaxes(gridcolor="#1f2937", linecolor="#374151",
+                     tickfont=dict(color="#6b7280"), rangeslider_visible=False)
+    fig.update_yaxes(gridcolor="#1f2937", linecolor="#374151",
+                     tickfont=dict(color="#6b7280"))
     return jsonify({"chart": json.dumps(fig, cls=PlotlyJSONEncoder)})
 
 
@@ -1291,7 +1315,8 @@ body{min-height:100vh;}
       <div class="stat-box"><div class="stat-label">52W High</div><div class="stat-val g" id="d-52h">-</div></div>
       <div class="stat-box"><div class="stat-label">52W Low</div><div class="stat-val r" id="d-52l">-</div></div>
       <div class="stat-box"><div class="stat-label">Today Vol</div><div class="stat-val b" id="d-vol">-</div></div>
-      <div class="stat-box"><div class="stat-label">90D Avg Vol</div><div class="stat-val" id="d-avgvol">-</div></div>
+      <div class="stat-box"><div class="stat-label">50D Avg Vol</div><div class="stat-val" id="d-avgvol">-</div></div>
+      <div class="stat-box"><div class="stat-label">Vol vs 50D Avg</div><div class="stat-val" id="d-volratio">-</div></div>
     </div>
     <div class="section-title">Indicators</div>
     <div class="grid4">
@@ -1515,7 +1540,12 @@ async function loadTechnical(){
     document.getElementById('d-bb-low').textContent=`₹${d.bb_lower}`;
     document.getElementById('d-bb-up').textContent=`₹${d.bb_upper}`;
     document.getElementById('d-vol').textContent=`${(d.volume/1e6).toFixed(1)}M`;
-    document.getElementById('d-avgvol').textContent=`${d.avg_volume}M`;
+    document.getElementById('d-avgvol').textContent=d.avg_volume_50d!=null?`${d.avg_volume_50d}M`:'N/A';
+    const vrEl=document.getElementById('d-volratio');
+    if(d.vol_ratio!=null){
+      vrEl.textContent=`${d.vol_ratio.toFixed(2)}×`;
+      vrEl.style.color=d.vol_ratio>=2?'#34d399':d.vol_ratio>=1.3?'#fbbf24':'#9ca3af';
+    } else { vrEl.textContent='N/A'; }
 
     const stochEl=document.getElementById('d-stoch');
     if(d.stoch_k!=null){

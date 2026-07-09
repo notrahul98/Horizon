@@ -84,7 +84,9 @@ def get_watchlist(cache_ok=True) -> list[dict]:
             return cache["stocks"]
 
     # 2. fresh fetch (slow — avoid calling on every import!)
-    print("📥 Fetching Nifty 150 metadata from yfinance (this may take a minute) ...")
+    # Plain ASCII on purpose: an emoji here crashes with UnicodeEncodeError on
+    # cp1252 consoles (Windows), killing the whole refresh thread mid-run.
+    print("Fetching Nifty 150 metadata from yfinance (this may take a minute) ...")
 
     import yfinance as yf  # lazy import so config.py loads fast
 
@@ -109,7 +111,7 @@ def get_watchlist(cache_ok=True) -> list[dict]:
     with open(CACHE_FILE, "w") as f:
         json.dump({"timestamp": datetime.now().isoformat(), "stocks": stocks_data}, f)
 
-    print(f"✅  Cached {len(stocks_data)} stocks")
+    print(f"Cached {len(stocks_data)} stocks")
     return stocks_data
 
 
