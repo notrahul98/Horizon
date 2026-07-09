@@ -29,6 +29,7 @@ from agents.deepseek_agent import DeepSeekAgent
 from agents.consensus_engine import ConsensusEngine
 from scanner import scan_for_candidates, format_daily_report
 from notifications import send_telegram, telegram_enabled
+import trades_store
 
 # Phase 4: multi-agent consensus. No ANTHROPIC_API_KEY/GEMINI_API_KEY/DEEPSEEK_API_KEY
 # are wired up (that's a real integration with real cost, not something to switch on
@@ -451,6 +452,48 @@ def _generate_report_data():
     }
 
 
+def _settle_scanner_trades():
+    """Walk each OPEN scanner-sourced mock trade forward through the daily
+    bars since entry and close it if its stop or target was touched.
+    Conservative on the ambiguous day where a bar spans both levels: assume
+    the stop was hit first — overstating losses beats overstating wins in
+    a system whose accuracy you're trying to honestly measure."""
+    for t in trades_store.open_trades(source="SCANNER"):
+        with get_conn() as c:
+            bars = c.execute(
+                """SELECT date, high, low FROM price_history
+                   WHERE symbol=? AND interval='day' AND date>? ORDER BY date""",
+                (t["symbol"], t["entry_date"]),
+            ).fetchall()
+        for bar in bars:
+            if t["stop_loss"] is not None and bar["low"] <= t["stop_loss"]:
+                trades_store.close_trade(t["id"], t["stop_loss"], bar["date"], "STOP_HIT")
+                logger.info("[trades] %s stopped out at %s on %s", t["symbol"], t["stop_loss"], bar["date"])
+                break
+            if t["target"] is not None and bar["high"] >= t["target"]:
+                trades_store.close_trade(t["id"], t["target"], bar["date"], "TARGET_HIT")
+                logger.info("[trades] %s hit target %s on %s", t["symbol"], t["target"], bar["date"])
+                break
+
+
+def _track_scanner_candidates(candidates, latest_date):
+    """Auto-log each scanner pick as a 1-unit mock trade so the system's
+    hit rate is measurable later. Skips symbols that already have an open
+    scanner trade — a stock staying on the candidate list day after day is
+    one thesis, not a new position each day."""
+    already_open = {t["symbol"] for t in trades_store.open_trades(source="SCANNER")}
+    for c in candidates:
+        if c["symbol"] in already_open:
+            continue
+        trades_store.add_trade(
+            symbol=c["symbol"], quantity=1, entry_price=c["entry"],
+            entry_date=str(latest_date), stop_loss=c["stop_loss"],
+            target=c["target"], source="SCANNER",
+            notes=f"{c['confidence']}% conf ({c['conviction']})",
+        )
+    logger.info("[trades] scanner candidates tracked (%d new)", len([c for c in candidates if c["symbol"] not in already_open]))
+
+
 def _run_daily_alert():
     global _last_report
     try:
@@ -459,6 +502,15 @@ def _run_daily_alert():
             logger.warning("[daily_alert] no data yet, skipping")
             return
         _last_report = data
+
+        # Settle yesterday's open scanner trades against fresh bars first,
+        # then log today's picks — so a stock that just stopped out can be
+        # re-picked as a new trade rather than blocked by its dead one.
+        try:
+            _settle_scanner_trades()
+            _track_scanner_candidates(data["candidates"], data["latest_date"])
+        except Exception:
+            logger.exception("[daily_alert] trade tracking failed (report still sent)")
 
         report_text = format_daily_report(
             candidates=data["candidates"], breadth=data["breadth"],
@@ -553,6 +605,128 @@ def report_page():
         report=_last_report,
         telegram_configured=telegram_enabled(),
     )
+
+
+# ── Mock trading (Phase 6) ──────────────────────────────────────
+def _latest_close_map():
+    with get_conn() as c:
+        rows = c.execute(
+            """SELECT p.symbol, p.close FROM price_history p
+               WHERE p.interval='day'
+                 AND p.date=(SELECT MAX(p2.date) FROM price_history p2
+                             WHERE p2.symbol=p.symbol AND p2.interval='day')"""
+        ).fetchall()
+    return {r["symbol"]: r["close"] for r in rows}
+
+
+@app.route("/trades")
+def trades_page():
+    return render_template_string(TRADES_HTML,
+        ist_time=ist_now(),
+        turso_configured=trades_store.turso_enabled(),
+    )
+
+
+@app.route("/api/trades")
+def api_trades():
+    trades = trades_store.list_trades()
+    closes = _latest_close_map()
+    for t in trades:
+        if t["status"] == "OPEN":
+            cur = closes.get(t["symbol"])
+            t["current_price"] = round(cur, 2) if cur is not None else None
+            basis = cur
+        else:
+            t["current_price"] = None
+            basis = t["exit_price"]
+        if basis is not None:
+            t["pnl"] = round((basis - t["entry_price"]) * t["quantity"], 2)
+            t["pnl_pct"] = round((basis - t["entry_price"]) / t["entry_price"] * 100, 2)
+        else:
+            t["pnl"] = t["pnl_pct"] = None
+
+    closed = [t for t in trades if t["status"] == "CLOSED" and t["pnl"] is not None]
+    wins = [t for t in closed if t["pnl"] > 0]
+    scanner_closed = [t for t in closed if t["source"] == "SCANNER"]
+    scanner_wins = [t for t in scanner_closed if t["pnl"] > 0]
+    summary = {
+        "open_count": sum(1 for t in trades if t["status"] == "OPEN"),
+        "open_pnl": round(sum(t["pnl"] for t in trades if t["status"] == "OPEN" and t["pnl"] is not None), 2),
+        "closed_count": len(closed),
+        "win_rate": round(len(wins) / len(closed) * 100, 1) if closed else None,
+        "scanner_closed": len(scanner_closed),
+        "scanner_win_rate": round(len(scanner_wins) / len(scanner_closed) * 100, 1) if scanner_closed else None,
+    }
+    return jsonify({"trades": trades, "summary": summary,
+                    "turso_configured": trades_store.turso_enabled()})
+
+
+@app.route("/api/trades", methods=["POST"])
+def api_add_trade():
+    body = request.get_json(silent=True) or {}
+    symbol = (body.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol is required"}), 400
+    if not symbol.endswith(".NS"):
+        symbol += ".NS"
+
+    with get_conn() as c:
+        known = c.execute("SELECT 1 FROM stocks WHERE symbol=?", (symbol,)).fetchone()
+    if not known:
+        return jsonify({"error": f"{symbol} is not in the tracked watchlist"}), 400
+
+    try:
+        quantity = float(body.get("quantity") or 1)
+        if quantity <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"error": "quantity must be a positive number"}), 400
+
+    entry_price = body.get("entry_price")
+    if entry_price in (None, ""):
+        entry_price = _latest_close_map().get(symbol)
+        if entry_price is None:
+            return jsonify({"error": "no price data for symbol; provide entry_price"}), 400
+    try:
+        entry_price = float(entry_price)
+        stop_loss = float(body["stop_loss"]) if body.get("stop_loss") not in (None, "") else None
+        target = float(body["target"]) if body.get("target") not in (None, "") else None
+    except (TypeError, ValueError):
+        return jsonify({"error": "prices must be numbers"}), 400
+
+    trades_store.add_trade(
+        symbol=symbol, quantity=quantity, entry_price=entry_price,
+        entry_date=datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d"),
+        stop_loss=stop_loss, target=target,
+        source="MANUAL", notes=(body.get("notes") or None),
+    )
+    return jsonify({"ok": True})
+
+
+@app.route("/api/trades/<int:trade_id>/close", methods=["POST"])
+def api_close_trade(trade_id):
+    body = request.get_json(silent=True) or {}
+    trade = next((t for t in trades_store.open_trades() if t["id"] == trade_id), None)
+    if trade is None:
+        return jsonify({"error": "open trade not found"}), 404
+
+    exit_price = body.get("exit_price")
+    if exit_price in (None, ""):
+        exit_price = _latest_close_map().get(trade["symbol"])
+        if exit_price is None:
+            return jsonify({"error": "no price data; provide exit_price"}), 400
+    trades_store.close_trade(
+        trade_id, float(exit_price),
+        datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d"),
+        "MANUAL",
+    )
+    return jsonify({"ok": True})
+
+
+@app.route("/api/trades/<int:trade_id>/delete", methods=["POST"])
+def api_delete_trade(trade_id):
+    trades_store.delete_trade(trade_id)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/chart/<symbol>")
@@ -1072,6 +1246,7 @@ tbody tr:hover .sym-col{background:var(--hover);}
     <span class="brand-name">NIFTY 150 TERMINAL</span>
   </div>
   <div class="nav-links">
+    <a href="/trades" class="nav-back">Mock Trades →</a>
     <a href="/report" class="nav-back">Daily Report →</a>
     <div class="nav-meta" id="navTime">{{ ist_time }}</div>
   </div>
@@ -1986,6 +2161,187 @@ async function regenerate(){
     btn.disabled=false;
   }
 }
+</script>
+</body>
+</html>"""
+
+TRADES_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock Trades — Nifty 150 Terminal</title>
+<style>
+""" + BASE_STYLE + r"""
+body{min-height:100vh;}
+.page{max-width:1100px;margin:0 auto;padding:20px 24px 60px;}
+.page-header{padding:16px 0;border-bottom:1px solid var(--border);margin-bottom:16px;}
+.page-title{font-size:20px;font-weight:700;color:var(--bright);}
+.page-meta{color:var(--dim);font-size:11px;margin-top:4px;}
+.kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:20px;}
+.kpi-row .kpi{border-left:3px solid var(--border);border-radius:0 8px 8px 0;padding:12px 14px;background:var(--card);}
+.trade-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:20px;align-items:end;}
+.trade-form label{font-size:9px;text-transform:uppercase;color:var(--dim);display:block;margin-bottom:4px;}
+.trade-form input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--bright);padding:7px 10px;border-radius:4px;font-family:inherit;font-size:12px;}
+.trade-form input:focus{outline:none;border-color:var(--blue);}
+.btn{background:var(--card);border:1px solid var(--border);color:var(--bright);padding:8px 16px;border-radius:4px;font-family:inherit;font-size:12px;cursor:pointer;}
+.btn:hover{border-color:var(--blue);color:var(--blue);}
+.btn.small{padding:4px 10px;font-size:10px;}
+.btn.danger:hover{border-color:var(--red);color:var(--red);}
+.trades-table{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:24px;}
+.trades-table th{text-align:left;padding:9px 10px;font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap;}
+.trades-table th.r,.trades-table td.r{text-align:right;}
+.trades-table td{padding:10px;border-bottom:1px solid rgba(30,30,42,.6);white-space:nowrap;}
+.src-tag{font-size:9px;padding:2px 6px;border-radius:3px;background:#1f2937;color:var(--dim);}
+.src-tag.scanner{background:rgba(56,189,248,.12);color:var(--blue);}
+.persist-note{font-size:11px;color:var(--amber);background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.3);padding:10px 14px;border-radius:4px;margin-bottom:16px;}
+.form-error{color:var(--red);font-size:11px;margin-top:8px;display:none;}
+</style>
+</head>
+<body>
+<nav class="nav">
+  <div class="nav-brand">
+    <a href="/" class="brand-name"><div class="dot" style="display:inline-block;vertical-align:middle;margin-right:8px"></div>NIFTY 150 TERMINAL</a>
+  </div>
+  <div class="nav-links">
+    <a href="/" class="nav-back">← Dashboard</a>
+    <a href="/report" class="nav-back">Daily Report →</a>
+    <div class="nav-meta" id="navTime">{{ ist_time }}</div>
+  </div>
+</nav>
+<div class="page">
+  <div class="page-header">
+    <div class="page-title">Mock Trades</div>
+    <div class="page-meta">Paper trading — no real money. Scanner picks are auto-tracked; add your own below.</div>
+  </div>
+
+  {% if not turso_configured %}
+  <div class="persist-note">Turso isn't configured yet — trades are stored on the server's local disk, which is <b>wiped on every redeploy</b>. Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in Railway to make them permanent (see replit.md).</div>
+  {% endif %}
+
+  <div class="kpi-row" id="summaryRow"></div>
+
+  <div class="section-title">Add a mock trade</div>
+  <form class="trade-form" id="tradeForm" onsubmit="return addTrade(event)">
+    <div><label>Symbol</label><input id="f-symbol" placeholder="RELIANCE" required></div>
+    <div><label>Quantity</label><input id="f-qty" type="number" step="any" min="0.01" value="1"></div>
+    <div><label>Entry ₹ (blank = latest)</label><input id="f-entry" type="number" step="any" min="0.01"></div>
+    <div><label>Stop Loss ₹</label><input id="f-sl" type="number" step="any" min="0"></div>
+    <div><label>Target ₹</label><input id="f-target" type="number" step="any" min="0"></div>
+    <div><button class="btn" type="submit" id="addBtn">Add Trade</button></div>
+  </form>
+  <div class="form-error" id="formError"></div>
+
+  <div class="section-title">Open Positions</div>
+  <table class="trades-table"><thead><tr>
+    <th>Symbol</th><th>Src</th><th class="r">Qty</th><th class="r">Entry ₹</th><th class="r">Current ₹</th>
+    <th class="r">SL / Target</th><th class="r">P&amp;L</th><th class="r">Entered</th><th></th>
+  </tr></thead><tbody id="openBody"></tbody></table>
+
+  <div class="section-title">Closed Trades</div>
+  <table class="trades-table"><thead><tr>
+    <th>Symbol</th><th>Src</th><th class="r">Qty</th><th class="r">Entry ₹</th><th class="r">Exit ₹</th>
+    <th class="r">P&amp;L</th><th>Reason</th><th class="r">Exited</th><th></th>
+  </tr></thead><tbody id="closedBody"></tbody></table>
+
+  <div style="font-size:11px;color:var(--dim);margin-top:14px;line-height:1.6;">Simulated positions against end-of-day prices — not real orders, not financial advice. Scanner trades settle conservatively: if a day's bar spans both stop and target, the stop is assumed hit first.</div>
+</div>
+<script>
+setInterval(()=>{
+  document.getElementById('navTime').textContent=new Date().toLocaleString('en-IN',{
+    day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',
+    hour12:false,timeZone:'Asia/Kolkata'
+  })+' IST';
+},1000);
+
+function pnlSpan(t){
+  if(t.pnl_pct==null) return '<span class="dim">-</span>';
+  const cls=t.pnl_pct>=0?'up':'dn';
+  const sign=t.pnl_pct>=0?'+':'';
+  return `<span class="${cls}">${sign}${t.pnl_pct.toFixed(2)}% (₹${t.pnl.toFixed(2)})</span>`;
+}
+
+async function loadTrades(){
+  const r=await fetch('/api/trades');
+  const d=await r.json();
+  const s=d.summary;
+
+  document.getElementById('summaryRow').innerHTML=`
+    <div class="kpi"><div class="kpi-label">Open Positions</div><div class="kpi-val">${s.open_count}</div></div>
+    <div class="kpi"><div class="kpi-label">Open P&amp;L</div><div class="kpi-val ${s.open_pnl>=0?'g':'r'}">₹${s.open_pnl.toFixed(2)}</div></div>
+    <div class="kpi"><div class="kpi-label">Closed Trades</div><div class="kpi-val">${s.closed_count}</div></div>
+    <div class="kpi"><div class="kpi-label">Win Rate</div><div class="kpi-val">${s.win_rate!=null?s.win_rate+'%':'—'}</div></div>
+    <div class="kpi"><div class="kpi-label">Scanner Win Rate</div><div class="kpi-val b">${s.scanner_win_rate!=null?s.scanner_win_rate+'% ('+s.scanner_closed+')':'—'}</div></div>`;
+
+  const srcTag=t=>`<span class="src-tag ${t.source==='SCANNER'?'scanner':''}">${t.source}</span>`;
+  const open=d.trades.filter(t=>t.status==='OPEN');
+  const closed=d.trades.filter(t=>t.status==='CLOSED');
+
+  document.getElementById('openBody').innerHTML=open.length?open.map(t=>`
+    <tr>
+      <td><a href="/stock/${t.symbol}" style="color:var(--bright);font-weight:700;text-decoration:none">${t.symbol.replace('.NS','')}</a></td>
+      <td>${srcTag(t)}</td>
+      <td class="r">${t.quantity}</td>
+      <td class="r">${t.entry_price.toFixed(2)}</td>
+      <td class="r">${t.current_price!=null?t.current_price.toFixed(2):'-'}</td>
+      <td class="r dim">${t.stop_loss!=null?t.stop_loss.toFixed(2):'—'} / ${t.target!=null?t.target.toFixed(2):'—'}</td>
+      <td class="r">${pnlSpan(t)}</td>
+      <td class="r dim">${t.entry_date}</td>
+      <td class="r">
+        <button class="btn small" onclick="closeTrade(${t.id})">Close</button>
+        <button class="btn small danger" onclick="deleteTrade(${t.id})">✕</button>
+      </td>
+    </tr>`).join(''):'<tr><td colspan="9" style="color:var(--dim);text-align:center;padding:20px">No open positions</td></tr>';
+
+  document.getElementById('closedBody').innerHTML=closed.length?closed.map(t=>`
+    <tr>
+      <td><a href="/stock/${t.symbol}" style="color:var(--bright);font-weight:700;text-decoration:none">${t.symbol.replace('.NS','')}</a></td>
+      <td>${srcTag(t)}</td>
+      <td class="r">${t.quantity}</td>
+      <td class="r">${t.entry_price.toFixed(2)}</td>
+      <td class="r">${t.exit_price!=null?t.exit_price.toFixed(2):'-'}</td>
+      <td class="r">${pnlSpan(t)}</td>
+      <td class="dim">${t.exit_reason||'-'}</td>
+      <td class="r dim">${t.exit_date||'-'}</td>
+      <td class="r"><button class="btn small danger" onclick="deleteTrade(${t.id})">✕</button></td>
+    </tr>`).join(''):'<tr><td colspan="9" style="color:var(--dim);text-align:center;padding:20px">No closed trades yet</td></tr>';
+}
+
+async function addTrade(e){
+  e.preventDefault();
+  const err=document.getElementById('formError');
+  err.style.display='none';
+  const btn=document.getElementById('addBtn');
+  btn.disabled=true;
+  try{
+    const r=await fetch('/api/trades',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        symbol:document.getElementById('f-symbol').value,
+        quantity:document.getElementById('f-qty').value,
+        entry_price:document.getElementById('f-entry').value,
+        stop_loss:document.getElementById('f-sl').value,
+        target:document.getElementById('f-target').value,
+      })});
+    const d=await r.json();
+    if(d.error){err.textContent=d.error;err.style.display='block';}
+    else{document.getElementById('tradeForm').reset();loadTrades();}
+  }catch(ex){err.textContent='Request failed: '+ex.message;err.style.display='block';}
+  btn.disabled=false;
+  return false;
+}
+
+async function closeTrade(id){
+  if(!confirm('Close this trade at the latest price?'))return;
+  await fetch(`/api/trades/${id}/close`,{method:'POST'});
+  loadTrades();
+}
+async function deleteTrade(id){
+  if(!confirm('Delete this trade entirely? This cannot be undone.'))return;
+  await fetch(`/api/trades/${id}/delete`,{method:'POST'});
+  loadTrades();
+}
+
+loadTrades();
 </script>
 </body>
 </html>"""

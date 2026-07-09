@@ -50,6 +50,17 @@ The dashboard's KPI cards (Gainers, Losers, Top Gainer, Near 52W High/Low) are c
 
 Test/regenerate on demand via `POST /api/send-report` (updates `/report` and retries Telegram if configured) or the "Regenerate" button on the report page itself.
 
+**Phase 6 — mock trading (`/trades`, linked from the dashboard nav)**: paper-trading view for tracking performance without real money. Two trade sources:
+- **MANUAL** — add via the form (symbol must be in the watchlist; entry price defaults to the latest close if left blank); close at latest price or delete from the UI.
+- **SCANNER** — every daily scanner candidate is auto-logged as a 1-unit trade with its entry/SL/target, then settled automatically on subsequent daily refreshes by walking the daily bars: low touches stop → closed at stop (`STOP_HIT`), high touches target → closed at target (`TARGET_HIT`). On the ambiguous bar that spans both, the stop is assumed hit first — deliberately conservative, since overstating losses beats overstating wins when measuring the system's own accuracy. Duplicate prevention: a symbol with an open scanner trade isn't re-entered while it stays on the candidate list. The "Scanner Win Rate" KPI on `/trades` is the honest scorecard of the Phase 5 screen over time.
+
+**Storage is Turso** (hosted libSQL/SQLite free tier) because Railway has no persistent volume and trades — unlike prices — can't be re-fetched after a redeploy wipes the disk. `trades_store.py` talks to Turso via its Hrana-over-HTTP pipeline API with plain `requests` (no libsql client package → no native wheel issues on the Railway builder or Windows dev). Setup:
+1. In the [Turso dashboard](https://turso.tech): create a database → copy its URL (`libsql://<db>-<org>.turso.io`).
+2. Create an auth token for it (database → tokens, or `turso db tokens create <db>`).
+3. Set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` in Railway's environment variables (never paste the token into chat/code).
+
+Without those env vars it falls back to local SQLite (`data/trades.db`) with a loud warning — fully functional for local dev, but wiped on every Railway redeploy. The schema is created lazily on first use (`_ensure_schema()`), never at import, so an unreachable Turso can't stall app boot.
+
 Without those two env vars, `send_telegram()` logs what it would have sent instead of failing the job — same graceful-offline pattern as the Phase 4 agents. Test any time via `POST /api/send-report` (returns `report_preview` either way, plus whether it actually sent).
 
 ### Node.js workspace — scaffolding only, not runnable as-is
@@ -88,6 +99,7 @@ stock-collector/
                         page's "AI Signal" tab. Promoted out of experiments/ (see below).
   scanner.py          — Phase 5: rule-based swing-trade candidate screen + ATR stop/target
   notifications.py    — Phase 5: Telegram send (email/SMS not wired up)
+  trades_store.py     — Phase 6: mock-trade storage on Turso (local SQLite fallback)
 
 experiments/          — parked prototype: technical-analysis + self-learning engine
                         (core/, learning/, reports/). The agents/ subfolder that used to
