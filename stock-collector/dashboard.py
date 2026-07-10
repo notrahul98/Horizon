@@ -9,6 +9,7 @@ import sqlite3
 import json
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -619,6 +620,41 @@ def _latest_close_map():
     return {r["symbol"]: r["close"] for r in rows}
 
 
+def _is_market_hours_ist():
+    ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    if ist.weekday() >= 5:
+        return False
+    mins = ist.hour * 60 + ist.minute
+    return 9 * 60 <= mins <= (15 * 60 + 35)
+
+
+def _live_price_map(symbols):
+    """Live last-traded price for open mock-trade symbols, via the same
+    lightweight yfinance fast_info call as /api/live-price. Unlike that
+    single-symbol ticker, the number of open positions here can grow over
+    time (scanner picks accumulate until they hit stop/target), so fetches
+    run concurrently rather than one-by-one — keeps the page responsive
+    regardless of how many trades are open. Any symbol whose fetch fails
+    is simply left out of the returned map; the caller falls back to the
+    last stored close for it."""
+    import yfinance as yf
+
+    if not symbols:
+        return {}
+
+    def fetch_one(symbol):
+        try:
+            price = yf.Ticker(symbol).fast_info.get('lastPrice')
+            return symbol, float(price) if price is not None else None
+        except Exception as e:
+            logger.warning("[trades] live price failed for %s: %s", symbol, e)
+            return symbol, None
+
+    with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as ex:
+        results = list(ex.map(fetch_one, symbols))
+    return {sym: price for sym, price in results if price is not None}
+
+
 @app.route("/trades")
 def trades_page():
     return render_template_string(TRADES_HTML,
@@ -631,13 +667,20 @@ def trades_page():
 def api_trades():
     trades = trades_store.list_trades()
     closes = _latest_close_map()
+    open_symbols = sorted({t["symbol"] for t in trades if t["status"] == "OPEN"})
+    # Only pay for live yfinance calls while the market's actually open —
+    # outside those hours fast_info just returns the same previous close
+    # already sitting in price_history, so there's nothing "live" to gain.
+    live = _live_price_map(open_symbols) if _is_market_hours_ist() else {}
     for t in trades:
         if t["status"] == "OPEN":
-            cur = closes.get(t["symbol"])
+            cur = live.get(t["symbol"], closes.get(t["symbol"]))
             t["current_price"] = round(cur, 2) if cur is not None else None
+            t["price_is_live"] = t["symbol"] in live
             basis = cur
         else:
             t["current_price"] = None
+            t["price_is_live"] = False
             basis = t["exit_price"]
         if basis is not None:
             t["pnl"] = round((basis - t["entry_price"]) * t["quantity"], 2)
@@ -712,7 +755,10 @@ def api_close_trade(trade_id):
 
     exit_price = body.get("exit_price")
     if exit_price in (None, ""):
-        exit_price = _latest_close_map().get(trade["symbol"])
+        if _is_market_hours_ist():
+            exit_price = _live_price_map([trade["symbol"]]).get(trade["symbol"])
+        if exit_price is None:
+            exit_price = _latest_close_map().get(trade["symbol"])
         if exit_price is None:
             return jsonify({"error": "no price data; provide exit_price"}), 400
     trades_store.close_trade(
@@ -2067,8 +2113,19 @@ body{min-height:100vh;}
 .cand-table th{text-align:left;padding:9px 10px;font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap;}
 .cand-table th.r,.cand-table td.r{text-align:right;}
 .cand-table td{padding:10px;border-bottom:1px solid rgba(30,30,42,.6);white-space:nowrap;}
-.cand-table tr{cursor:pointer;}
-.cand-table tr:hover td{background:var(--hover);}
+.cand-table tr.cand-row{cursor:pointer;}
+.cand-table tr.cand-row:hover td{background:var(--hover);}
+.why-btn{background:none;border:1px solid var(--border);color:var(--dim);padding:3px 9px;border-radius:4px;font-family:inherit;font-size:10px;cursor:pointer;}
+.why-btn:hover{border-color:var(--blue);color:var(--blue);}
+.why-row td{white-space:normal;background:var(--bg);}
+.why-summary{color:var(--bright);font-size:12px;line-height:1.6;margin-bottom:10px;}
+.why-agents{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;}
+.why-agent{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11px;}
+.why-agent .a-head{display:flex;justify-content:space-between;color:var(--dim);font-size:9px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:5px;}
+.why-agent .a-sig{font-weight:700;}
+.why-agent .a-sig.up{color:var(--green);}
+.why-agent .a-sig.dn{color:var(--red);}
+.why-agent .a-reason{color:var(--bright);line-height:1.5;}
 .telegram-note{font-size:11px;color:var(--dim);background:var(--card);border:1px solid var(--border);padding:10px 14px;border-radius:4px;margin-top:20px;}
 .disclaimer{font-size:11px;color:var(--dim);margin-top:14px;line-height:1.6;}
 </style>
@@ -2117,18 +2174,35 @@ body{min-height:100vh;}
         <th class="r">Risk%</th>
         <th class="r">Reward%</th>
         <th class="r">Confidence</th>
+        <th class="r">Why</th>
       </tr>
     </thead>
     <tbody>
       {% for c in report.candidates %}
-      <tr onclick="location.href='/stock/{{ c.symbol }}'">
-        <td><span class="sym">{{ c.symbol.replace('.NS','') }}</span><div class="modal-row-name">{{ c.name }}</div></td>
+      <tr class="cand-row" onclick="location.href='/stock/{{ c.symbol }}'">
+        <td><span class="sym">{{ c.symbol.replace('.NS','') }}</span></td>
         <td class="r">{{ "%.2f"|format(c.entry) }}</td>
         <td class="r dn">{{ "%.2f"|format(c.stop_loss) }} (-{{ c.risk_pct }}%)</td>
         <td class="r up">{{ "%.2f"|format(c.target) }} (+{{ c.reward_pct }}%)</td>
         <td class="r dn">-{{ c.risk_pct }}%</td>
         <td class="r up">+{{ c.reward_pct }}%</td>
         <td class="r">{{ c.confidence }}% ({{ c.conviction }})</td>
+        <td class="r"><button class="why-btn" onclick="toggleWhy(event,'why-{{ loop.index }}')">Why? ▾</button></td>
+      </tr>
+      <tr class="why-row" id="why-{{ loop.index }}" style="display:none">
+        <td colspan="8">
+          <div class="why-summary">{{ c.reason_summary }}</div>
+          {% if c.agent_details %}
+          <div class="why-agents">
+            {% for a in c.agent_details %}
+            <div class="why-agent">
+              <div class="a-head"><span>{{ a.agent }}</span><span class="a-sig {{ 'up' if a.signal=='BUY' else ('dn' if a.signal=='SELL' else '') }}">{{ a.signal }} · {{ a.confidence }}%</span></div>
+              <div class="a-reason">{{ a.reasoning }}</div>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </td>
       </tr>
       {% endfor %}
     </tbody>
@@ -2160,6 +2234,12 @@ async function regenerate(){
     btn.textContent='Failed — retry';
     btn.disabled=false;
   }
+}
+
+function toggleWhy(ev,id){
+  ev.stopPropagation();
+  const row=document.getElementById(id);
+  row.style.display = row.style.display==='none' ? 'table-row' : 'none';
 }
 </script>
 </body>
@@ -2232,7 +2312,13 @@ body{min-height:100vh;}
   </form>
   <div class="form-error" id="formError"></div>
 
-  <div class="section-title">Open Positions</div>
+  <div class="section-title" style="display:flex;align-items:center;gap:8px;">
+    Open Positions
+    <span id="liveIndicator" style="display:none;align-items:center;gap:5px;">
+      <span style="width:6px;height:6px;border-radius:50%;background:var(--green);animation:blink 2s infinite;display:inline-block;"></span>
+      <span style="font-size:10px;color:var(--dim);font-weight:400;text-transform:none;letter-spacing:normal;">live prices</span>
+    </span>
+  </div>
   <table class="trades-table"><thead><tr>
     <th>Symbol</th><th>Src</th><th class="r">Qty</th><th class="r">Entry ₹</th><th class="r">Current ₹</th>
     <th class="r">SL / Target</th><th class="r">P&amp;L</th><th class="r">Entered</th><th></th>
@@ -2277,13 +2363,15 @@ async function loadTrades(){
   const open=d.trades.filter(t=>t.status==='OPEN');
   const closed=d.trades.filter(t=>t.status==='CLOSED');
 
+  const liveDot=t=>t.price_is_live?'<span title="live price" style="display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--green);margin-right:5px;animation:blink 2s infinite;"></span>':'';
+
   document.getElementById('openBody').innerHTML=open.length?open.map(t=>`
     <tr>
       <td><a href="/stock/${t.symbol}" style="color:var(--bright);font-weight:700;text-decoration:none">${t.symbol.replace('.NS','')}</a></td>
       <td>${srcTag(t)}</td>
       <td class="r">${t.quantity}</td>
       <td class="r">${t.entry_price.toFixed(2)}</td>
-      <td class="r">${t.current_price!=null?t.current_price.toFixed(2):'-'}</td>
+      <td class="r">${liveDot(t)}${t.current_price!=null?t.current_price.toFixed(2):'-'}</td>
       <td class="r dim">${t.stop_loss!=null?t.stop_loss.toFixed(2):'—'} / ${t.target!=null?t.target.toFixed(2):'—'}</td>
       <td class="r">${pnlSpan(t)}</td>
       <td class="r dim">${t.entry_date}</td>
@@ -2292,6 +2380,9 @@ async function loadTrades(){
         <button class="btn small danger" onclick="deleteTrade(${t.id})">✕</button>
       </td>
     </tr>`).join(''):'<tr><td colspan="9" style="color:var(--dim);text-align:center;padding:20px">No open positions</td></tr>';
+
+  const ind=document.getElementById('liveIndicator');
+  ind.style.display = open.some(t=>t.price_is_live) ? 'inline-flex' : 'none';
 
   document.getElementById('closedBody').innerHTML=closed.length?closed.map(t=>`
     <tr>
@@ -2341,7 +2432,32 @@ async function deleteTrade(id){
   loadTrades();
 }
 
+// Re-poll /api/trades during market hours so open positions' price/P&L
+// stay current without a manual reload — same scoping rules as the detail
+// page's live ticker: only while NSE is open, paused when the tab is hidden.
+let tradesPoller=null;
+function isMarketHours(){
+  const ist=new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Kolkata'}));
+  const day=ist.getDay();
+  if(day===0||day===6) return false;
+  const mins=ist.getHours()*60+ist.getMinutes();
+  return mins>=9*60 && mins<=(15*60+35);
+}
+function startTradesPolling(){
+  if(tradesPoller) clearInterval(tradesPoller);
+  tradesPoller = isMarketHours() ? setInterval(loadTrades, 30000) : null;
+}
+document.addEventListener('visibilitychange', ()=>{
+  if(document.hidden){
+    if(tradesPoller){clearInterval(tradesPoller);tradesPoller=null;}
+  } else {
+    loadTrades();
+    startTradesPolling();
+  }
+});
+
 loadTrades();
+startTradesPolling();
 </script>
 </body>
 </html>"""

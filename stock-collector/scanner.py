@@ -32,6 +32,22 @@ def calc_atr(high, low, close, period=14):
     return true_range.rolling(period).mean()
 
 
+def _build_reason_summary(detail, consensus, atr, atr_multiple, reward_risk):
+    """One readable paragraph explaining why this symbol cleared the screen —
+    shown on /report (expandable per candidate) and folded into the Telegram
+    text so the "why", not just the numbers, travels with the pick."""
+    votes = consensus.get("votes", {})
+    return (
+        f"AI consensus: {votes.get('buy', 0)}/{votes.get('total', 0)} agents voted BUY "
+        f"({consensus['confidence']}% avg confidence, {consensus['conviction']} conviction). "
+        f"Trend alignment: close ₹{detail['close']} > EMA20 ₹{detail['ema20']} > EMA50 ₹{detail['ema50']} "
+        f"confirms a {detail['trend'].lower()} setup. "
+        f"RSI {detail['rsi']} is below the 70 overbought line, leaving room to run. "
+        f"Stop/target sized off ATR(14)={round(atr, 2)}: stop is {atr_multiple}×ATR below entry, "
+        f"target is a {reward_risk}:1 reward/risk multiple beyond that."
+    )
+
+
 def scan_for_candidates(symbols, get_stock_detail_fn, get_history_fn, get_ai_consensus_fn,
                          reward_risk=2.5, min_confidence=55, atr_multiple=1.5):
     candidates = []
@@ -77,6 +93,9 @@ def scan_for_candidates(symbols, get_stock_detail_fn, get_history_fn, get_ai_con
                 "conviction": consensus["conviction"],
                 "rsi": detail["rsi"],
                 "trend": detail["trend"],
+                "votes": consensus.get("votes", {}),
+                "agent_details": consensus.get("agent_details", []),
+                "reason_summary": _build_reason_summary(detail, consensus, atr, atr_multiple, reward_risk),
             })
         except Exception:
             logger.exception("[scanner] failed for %s", symbol)
@@ -111,6 +130,8 @@ def format_daily_report(candidates, breadth, total_stocks, gainers, losers, late
                 f"(-{c['risk_pct']}%) | Target ₹{c['target']} (+{c['reward_pct']}%) | "
                 f"{c['confidence']}% conf ({c['conviction']})"
             )
+            if c.get("reason_summary"):
+                lines.append(f"  _{c['reason_summary']}_")
     lines.append("")
     lines.append(
         "_Rule-based technical screen only — not financial advice. "
