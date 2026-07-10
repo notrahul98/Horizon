@@ -31,12 +31,12 @@ from scanner import scan_for_candidates, format_daily_report
 from notifications import send_telegram, telegram_enabled
 import trades_store
 
-# Phase 4: multi-agent consensus. No ANTHROPIC_API_KEY/GEMINI_API_KEY/DEEPSEEK_API_KEY
-# are wired up (that's a real integration with real cost, not something to switch on
-# silently) - each agent runs its own rule-based technical heuristic instead
-# (see agents/*_agent.py's _offline_analysis()). This is real signal from real
-# indicators, just not an LLM call yet. Set the env vars and pass them below to
-# upgrade an agent to live API analysis without changing anything else.
+# Phase 4: multi-agent consensus. Each agent runs a rule-based technical
+# heuristic (see agents/*_agent.py's _offline_analysis()) unless its API key
+# env var is set. GeminiAgent has a real live-API path (throttled for the
+# free tier, falls back to the heuristic on any failure); ClaudeAgent and
+# DeepSeekAgent are still heuristic-only — setting their keys flips the UI
+# banner but their live-call code hasn't been written yet.
 _claude_agent = ClaudeAgent(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 _gemini_agent = GeminiAgent(api_key=os.environ.get("GEMINI_API_KEY"))
 _deepseek_agent = DeepSeekAgent(api_key=os.environ.get("DEEPSEEK_API_KEY"))
